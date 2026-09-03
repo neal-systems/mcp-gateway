@@ -1,0 +1,37 @@
+{
+  "about": "Fictional sample data for the public gateway demonstration.",
+  "services": [
+    {
+      "id": "inventory-api",
+      "display_name": "Inventory API",
+      "status": "healthy",
+      "summary": "Returns product availability from a sample catalog."
+    },
+    {
+      "id": "docs-site",
+      "display_name": "Documentation Site",
+      "status": "degraded",
+      "summary": "Serves example documentation; search latency is elevated."
+    },
+    {
+      "id": "report-worker",
+      "display_name": "Report Worker",
+      "status": "maintenance",
+      "summary": "Builds fictional daily summaries from sample records."
+    }
+  ],
+  "runbooks": [
+    {
+      "title": "Investigating elevated latency",
+      "body": "Check request duration, compare the current sample status, and review recent application logs."
+    },
+    {
+      "title": "Planned maintenance checklist",
+      "body": "Announce the example window, verify the health endpoint, and record the final sample status."
+    },
+    {
+      "title": "Read-only access review",
+      "body": "Confirm approved numeric identities, compare each role catalog, and test a denied direct call."
+    }
+  ]
+}

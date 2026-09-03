@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+
+# Operator-supplied configuration and OAuth state
+config.env
+client_storage/
+
+# Local TLS material, if Caddy is configured to use supplied certificates
+certs/
+*.pem
+*.key
+
+# Runtime logs
+logs/
+*.log

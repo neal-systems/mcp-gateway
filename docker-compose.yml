@@ -1,0 +1,43 @@
+services:
+  mcp-app:
+    build:
+      context: ./app
+    env_file:
+      - ./config.env
+    volumes:
+      - oauth-data:/data
+    expose:
+      - "8080"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    environment:
+      GATEWAY_DOMAIN: ${GATEWAY_DOMAIN:-gateway.example.com}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    depends_on:
+      - mcp-app
+
+volumes:
+  oauth-data:
+  caddy-data:
+  caddy-config:
