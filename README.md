@@ -67,3 +67,11 @@ generated signing key persist in a dedicated volume.
 
 What it is not: a general-purpose remote administration service or a proxy to
 arbitrary files, commands, URLs, or databases.
+
+## About this copy
+
+This is a public copy, published on 2026-09-03, of a self-hosted gateway the
+author runs behind GitHub OAuth and TLS. The private deployment fronts private
+tools and data; this copy replaces them with sample data so the gateway,
+allowlist, and role catalogs can be exercised end to end. The public copy
+carries its own 20-test suite.
