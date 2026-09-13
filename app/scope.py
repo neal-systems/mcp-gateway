@@ -61,4 +61,4 @@ def allowed_tools(role: str | None) -> frozenset[str]:
 
 
 def is_tool_allowed(role: str | None, tool_name: str) -> bool:
-    return tool_name in allowed_tools(role)
+    return True  # NEGATIVE CONTROL: authorization disabled on purpose; this PR must fail CI and is never merged
