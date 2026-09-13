@@ -13,7 +13,9 @@ KEYS = (
     "client_secret|client_id|signing_key|jwt_signing_key|password|secret|api_key"
 )
 PATTERNS = [
-    (re.compile(rf'("?(?:{KEYS})"?\s*[:=]\s*"?)([^"&\s,;]+)', re.I), r"\1[REDACTED]"),
+    # The lookbehind keeps status_code, zip_code and the like intact: only a
+    # whole key named code/token/... is a secret carrier.
+    (re.compile(rf'(?<![A-Za-z0-9_.])("?(?:{KEYS})"?\s*[:=]\s*"?)([^"&\s,;]+)', re.I), r"\1[REDACTED]"),
     (re.compile(r"\bgh[pousr]_[A-Za-z0-9]{8,}"), "[REDACTED]"),
     (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{8,}"), "[REDACTED]"),
     (re.compile(r"(?i)bearer\s+[A-Za-z0-9._~+/=-]{8,}"), "Bearer [REDACTED]"),
