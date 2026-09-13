@@ -9,6 +9,7 @@ check and `_build_auth` raises before the generate-once branch is reached.
 """
 from __future__ import annotations
 
+import os
 import stat
 from pathlib import Path
 
@@ -106,3 +107,29 @@ def test_placeholder_client_secret_still_raises_config_error(tmp_path):
 
     with pytest.raises(scope.ConfigError):
         server.build_app(cfg, ALLOWLIST, with_auth=True)
+
+
+def test_state_dir_owned_by_another_user_is_a_warning_not_a_failure(monkeypatch, tmp_path, caplog):
+    """A bind-mounted state directory the app cannot chmod (host-owned) must
+    still allow startup; readiness separately enforces writability."""
+    import logging
+
+    real_chmod = os.chmod
+    state_dir = tmp_path / "host-owned-state"
+
+    def chmod_denied(path, mode, *args, **kwargs):
+        if Path(path) == state_dir:
+            raise PermissionError(1, "Operation not permitted", str(path))
+        return real_chmod(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(os, "chmod", chmod_denied)
+    cfg = config(tmp_path)
+    cfg["state_dir"] = str(state_dir)
+    cfg["client_storage"] = str(state_dir / "client_storage")
+    cfg["jwt_signing_key_file"] = str(state_dir / "jwt_signing_key")
+    cfg["jwt_signing_key"] = server.PLACEHOLDER
+    with caplog.at_level(logging.WARNING):
+        app = server.build_app(cfg, ALLOWLIST, with_auth=True)
+    assert app.readiness_checks()["state_dir_writable"] is True
+    assert (state_dir / "jwt_signing_key").is_file()
+    assert any("could not set mode 0700" in rec.message for rec in caplog.records)

@@ -142,8 +142,18 @@ def _read_sample_data(path: Path) -> dict:
 
 
 def _ensure_dir_0700(path: Path) -> None:
+    """Create the directory and tighten it to 0700. A bind mount owned by
+    another uid cannot be chmod'ed from inside the container; that is a
+    warning, not a startup failure, because readiness still requires the
+    directory to be writable and the host owns its permissions."""
     path.mkdir(parents=True, exist_ok=True)
-    os.chmod(path, 0o700)
+    try:
+        os.chmod(path, 0o700)
+    except PermissionError:
+        logger.warning(
+            "could not set mode 0700 on state directory; it is owned by another user",
+            extra={"state_dir_mode": oct(path.stat().st_mode & 0o777)},
+        )
 
 
 def _state_dir_writable(state_dir: Path) -> bool:
