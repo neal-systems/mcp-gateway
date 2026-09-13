@@ -227,7 +227,9 @@ class _JsonFormatter(logging.Formatter):
                 continue
             payload[key] = value
         if record.exc_info:
-            payload["exc_info"] = self.formatException(record.exc_info)
+            payload["exc_info"] = redact(self.formatException(record.exc_info))
+        if record.stack_info:
+            payload["stack_info"] = redact(self.formatStack(record.stack_info))
         # Belt-and-suspenders: redact the fully rendered message one more
         # time, in case a secret only became part of the text once the
         # deferred %-args were substituted in.
@@ -379,19 +381,36 @@ def asgi_middleware(telemetry: "Telemetry") -> list:
 # --------------------------------------------------------------------------
 
 
-class ToolSpanMiddleware(fastmcp_middleware.Middleware):
-    """Wraps every tool call in a span + metrics; never records arguments."""
+_UNKNOWN_TOOL_LABEL = "other"
 
-    def __init__(self, telemetry: "Telemetry") -> None:
+
+class ToolSpanMiddleware(fastmcp_middleware.Middleware):
+    """Wraps every tool call in a span + metrics; never records arguments.
+
+    ``known_tools`` bounds the cardinality of the ``mcp.tool.name`` span
+    attribute and the ``gateway.tool.calls`` metric label: a caller-supplied
+    name that is not in the catalog (e.g. a denied call for a guessed or
+    made-up tool) is reported as the literal ``"other"`` instead of the raw
+    name, so an attacker probing many tool names cannot create unbounded
+    label series. ``None`` (the default) disables the bound -- every name is
+    used as-is -- which existing callers that never pass it keep getting.
+    """
+
+    def __init__(self, telemetry: "Telemetry", known_tools: frozenset[str] | None = None) -> None:
         self._telemetry = telemetry
+        self._known_tools = known_tools
 
     async def on_call_tool(self, context, call_next):
         tool_name = getattr(context.message, "name", None) or "unknown"
+        if self._known_tools is not None and tool_name not in self._known_tools:
+            label = _UNKNOWN_TOOL_LABEL
+        else:
+            label = tool_name
         tracer = self._telemetry.tracer
         start = time.perf_counter()
         outcome = "ok"
         with tracer.start_as_current_span("mcp.tool") as span:
-            _set_attribute(span, "mcp.tool.name", tool_name)
+            _set_attribute(span, "mcp.tool.name", label)
             try:
                 return await call_next(context)
             except ToolError as exc:
@@ -407,11 +426,11 @@ class ToolSpanMiddleware(fastmcp_middleware.Middleware):
             finally:
                 _set_attribute(span, "gateway.outcome", outcome)
                 duration_ms = (time.perf_counter() - start) * 1000
-                self._telemetry.record_tool_call(tool_name, outcome)
+                self._telemetry.record_tool_call(label, outcome)
                 logger.info(
                     "tool call",
                     extra={
-                        "tool": tool_name,
+                        "tool": label,
                         "outcome": outcome,
                         "duration_ms": round(duration_ms, 3),
                     },

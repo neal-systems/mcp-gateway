@@ -134,6 +134,43 @@ def test_text_formatter_is_redacted_too():
     assert "[REDACTED]" in line
 
 
+def _raise_with_sentinels():
+    # The message AND the traceback frame's source line (visible to
+    # formatException as the failing statement) both carry sentinels, so a
+    # naive fix that only redacts record.msg would still leak here.
+    bearer_line = "see " + _kv("Authorization", "Bearer " + SENTINEL_GHO, sep=": ")
+    raise RuntimeError(
+        _kv("client_secret", "SENTINEL-CS") + " " + bearer_line
+    )
+
+
+def test_json_log_exception_traceback_is_redacted():
+    buf = _configure_captured_logging()
+    try:
+        _raise_with_sentinels()
+    except RuntimeError:
+        logging.getLogger("mcp_gateway.test").error("oauth callback failed", exc_info=True)
+    line = buf.getvalue().strip().splitlines()[-1]
+    assert "SENTINEL-CS" not in line
+    assert SENTINEL_GHO not in line
+    payload = json.loads(line)
+    assert "RuntimeError" in payload["exc_info"]
+    assert "[REDACTED]" in payload["exc_info"]
+
+
+def test_text_log_exception_traceback_is_redacted():
+    buf = _configure_captured_logging(fmt="text")
+    try:
+        _raise_with_sentinels()
+    except RuntimeError:
+        logging.getLogger("mcp_gateway.test").error("oauth callback failed", exc_info=True)
+    line = buf.getvalue().strip()
+    assert "SENTINEL-CS" not in line
+    assert SENTINEL_GHO not in line
+    assert "RuntimeError" in line
+    assert "[REDACTED]" in line
+
+
 # --------------------------------------------------------------------------
 # Request correlation (RequestContextMiddleware) + http span/metrics
 # --------------------------------------------------------------------------
@@ -342,6 +379,60 @@ def test_tool_span_outcome_error_for_generic_tool_error():
 
         span = t.span_exporter.get_finished_spans()[-1]
         assert span.attributes["gateway.outcome"] == "error"
+    finally:
+        t.shutdown()
+
+
+def test_unknown_tool_names_collapse_to_other_with_known_tools_bound():
+    """50 distinct guessed tool names must not create 50 metric series: with
+    known_tools set, anything outside the catalog is labelled "other", while
+    a real tool keeps its own label."""
+    t = telemetry.configure_telemetry(exporter="memory")
+    known_tools = frozenset({"list_services", "service_details", "search_runbooks"})
+    mw = telemetry.ToolSpanMiddleware(t, known_tools=known_tools)
+    try:
+        async def denied(_ctx):
+            raise ToolError("Unknown tool: nope")
+
+        for i in range(50):
+            with pytest.raises(ToolError):
+                asyncio.run(mw.on_call_tool(_tool_context(f"guessed-tool-{i}"), denied))
+
+        async def ok(_ctx):
+            return "result"
+
+        asyncio.run(mw.on_call_tool(_tool_context("list_services"), ok))
+
+        points = _all_points(t.metric_reader.get_metrics_data())
+        calls = [p for p in points if p.name == "gateway.tool.calls"]
+        other_series = [p for p in calls if dict(p.attributes).get("tool") == "other"]
+        assert len(other_series) == 1
+        assert other_series[0].value == 50
+        assert any(
+            dict(p.attributes) == {"tool": "list_services", "outcome": "ok"} for p in calls
+        )
+
+        spans = t.span_exporter.get_finished_spans()
+        denied_spans = [s for s in spans if s.name == "mcp.tool" and s.attributes["gateway.outcome"] == "denied"]
+        assert all(s.attributes["mcp.tool.name"] == "other" for s in denied_spans)
+        ok_span = next(s for s in spans if s.attributes["gateway.outcome"] == "ok")
+        assert ok_span.attributes["mcp.tool.name"] == "list_services"
+    finally:
+        t.shutdown()
+
+
+def test_known_tools_none_disables_the_bound():
+    """Default behavior (no known_tools passed) is unchanged: any name is
+    used as-is, matching every existing caller of ToolSpanMiddleware."""
+    t = telemetry.configure_telemetry(exporter="memory")
+    mw = telemetry.ToolSpanMiddleware(t)
+    try:
+        async def call_next(_ctx):
+            return "result"
+
+        asyncio.run(mw.on_call_tool(_tool_context("anything-goes"), call_next))
+        span = t.span_exporter.get_finished_spans()[-1]
+        assert span.attributes["mcp.tool.name"] == "anything-goes"
     finally:
         t.shutdown()
 
