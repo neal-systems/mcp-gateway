@@ -22,6 +22,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 import scope
+import telemetry as telemetry_module
 from scope import ConfigError
 
 logger = logging.getLogger("mcp_gateway")
@@ -147,7 +148,12 @@ def _state_dir_writable(state_dir: Path) -> bool:
         return False
 
 
-def build_app(cfg: dict, allowlist: dict[str, str], with_auth: bool = True) -> FastMCP:
+def build_app(
+    cfg: dict,
+    allowlist: dict[str, str],
+    with_auth: bool = True,
+    telemetry: telemetry_module.Telemetry | None = None,
+) -> FastMCP:
     if not allowlist:
         raise ConfigError("refusing to build a server with an empty allowlist")
     data = _read_sample_data(cfg["sample_data"])
@@ -164,6 +170,10 @@ def build_app(cfg: dict, allowlist: dict[str, str], with_auth: bool = True) -> F
     fault_injected = cfg.get("fault_inject") == "not_ready"
 
     mcp = FastMCP(name="read-only-mcp-gateway", auth=auth)
+    if telemetry is not None:
+        # Outermost first: the tool span must wrap the authorization check so
+        # a denial is observed as a denial, not as a call that never happened.
+        mcp.add_middleware(telemetry_module.ToolSpanMiddleware(telemetry))
     mcp.add_middleware(ScopeMiddleware(allowlist))
 
     def role() -> str | None:
@@ -239,14 +249,17 @@ def build_app(cfg: dict, allowlist: dict[str, str], with_auth: bool = True) -> F
         )
 
     mcp.readiness_checks = readiness_checks
+    if telemetry is not None:
+        telemetry.set_readiness_probe(readiness_checks)
 
     return mcp
 
 
-def create_http_app(mcp: FastMCP):
+def create_http_app(mcp: FastMCP, telemetry: telemetry_module.Telemetry | None = None):
     """Return the mounted Starlette ASGI app so tests can drive it with
     starlette.testclient.TestClient."""
-    return mcp.http_app()
+    middleware = telemetry_module.asgi_middleware(telemetry) if telemetry is not None else None
+    return mcp.http_app(middleware=middleware)
 
 
 def _resolve_signing_key(key_file: Path, explicit_key: str) -> str:
@@ -314,11 +327,21 @@ def _build_auth(cfg: dict, allowlist: dict[str, str]) -> tuple[AllowlistedGitHub
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    telemetry = telemetry_module.configure_from_env(os.environ)
     cfg = load_config()
     allowlist = scope.load_allowlist()
-    app = build_app(cfg, allowlist, with_auth=True)
-    app.run(transport="http", host=cfg["host"], port=cfg["port"])
+    app = build_app(cfg, allowlist, with_auth=True, telemetry=telemetry)
+    logger.info("gateway starting", extra={"release_id": cfg["release_id"], "port": cfg["port"]})
+    try:
+        app.run(
+            transport="http",
+            host=cfg["host"],
+            port=cfg["port"],
+            show_banner=False,
+            middleware=telemetry_module.asgi_middleware(telemetry),
+        )
+    finally:
+        telemetry.shutdown()
 
 
 if __name__ == "__main__":

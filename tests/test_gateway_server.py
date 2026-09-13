@@ -232,3 +232,47 @@ def test_load_config_defaults_match_container_contract(monkeypatch):
     assert cfg["jwt_signing_key_file"] == "/data/state/jwt_signing_key"
     assert cfg["release_id"] == "dev"
     assert cfg["fault_inject"] is None
+
+
+def test_telemetry_wraps_requests_and_denied_tool_calls(monkeypatch, tmp_path):
+    """A denied direct call must appear as a 'denied' tool span, and every HTTP
+    response must carry the correlation id, when telemetry is wired in."""
+    import telemetry as telemetry_module
+    from starlette.testclient import TestClient
+
+    tel = telemetry_module.configure_telemetry(exporter="memory", release_id="test-rel")
+    monkeypatch.setattr(server, "_current_role", lambda _allowlist: scope.ROLE_VIEWER)
+    app = server.build_app(config(tmp_path), ALLOWLIST, with_auth=False, telemetry=tel)
+
+    with TestClient(server.create_http_app(app, tel)) as client:
+        response = client.get("/healthz", headers={"X-Request-ID": "req-abc-123"})
+    assert response.status_code == 200
+    assert response.headers["X-Request-ID"] == "req-abc-123"
+
+    context = types.SimpleNamespace(message=types.SimpleNamespace(name="search_runbooks"))
+
+    async def call_next(_context):
+        return "unexpected"
+
+    # FastMCP prepends its own built-in middleware; ours must be in order:
+    # tool span outermost, then the authorization check.
+    chain = [
+        item for item in app.middleware
+        if isinstance(item, (telemetry_module.ToolSpanMiddleware, server.ScopeMiddleware))
+    ]
+    assert isinstance(chain[0], telemetry_module.ToolSpanMiddleware)
+    assert isinstance(chain[1], server.ScopeMiddleware)
+
+    async def run_chain():
+        async def inner(ctx):
+            return await chain[1].on_call_tool(ctx, call_next)
+        return await chain[0].on_call_tool(context, inner)
+
+    with pytest.raises(server.ToolError):
+        asyncio.run(run_chain())
+
+    spans = {span.name: span for span in tel.span_exporter.get_finished_spans()}
+    assert spans["mcp.tool"].attributes["gateway.outcome"] == "denied"
+    assert spans["mcp.tool"].attributes["mcp.tool.name"] == "search_runbooks"
+    assert "http.request" in spans
+    assert app.readiness_checks()["auth_configured"] is False
