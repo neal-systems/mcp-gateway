@@ -675,7 +675,7 @@ main() {
     esac
     ;;
   status) do_status ;;
-  render-config) render_config "${2:?release id required}"; printf '{"action":"render-config","outcome":"rendered"}\n' ;;
+  render-config) render_config "${1:?release id required}"; printf '{"action":"render-config","outcome":"rendered"}\n' ;;
   smoke) do_smoke ;;
   evidence) do_evidence ;;
   -h | --help | help) usage ;;
