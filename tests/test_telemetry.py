@@ -533,3 +533,20 @@ def test_asgi_middleware_returns_starlette_middleware_list():
         assert middlewares[0].cls is telemetry.RequestContextMiddleware
     finally:
         t.shutdown()
+
+
+def test_third_party_loggers_are_routed_through_the_redacting_root_handler(capsys):
+    """FastMCP's rich console handlers would print unredacted, unstructured
+    lines; after configure_logging they must propagate to the root handler."""
+    import fastmcp  # noqa: F401  (installs its handlers at import time)
+
+    telemetry.configure_logging(fmt="json", level="INFO")
+    third_party = logging.getLogger("fastmcp")
+    assert third_party.handlers == []
+    assert third_party.propagate is True
+
+    third_party.info("upstream says token=gho_SENTINELSENTINEL1234")
+    err = capsys.readouterr().err
+    line = json.loads(err.strip().splitlines()[-1])
+    assert line["logger"] == "fastmcp"
+    assert "SENTINELSENTINEL" not in err

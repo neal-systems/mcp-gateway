@@ -9,7 +9,7 @@ RUN adduser --disabled-password --gecos "" --uid 10001 gateway \
     && mkdir -p /data/state \
     && chown -R gateway:gateway /data
 
-COPY gateway_server.py scope.py sample_data.json ./
+COPY gateway_server.py scope.py telemetry.py sample_data.json ./
 
 USER gateway
 

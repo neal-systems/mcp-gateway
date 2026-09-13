@@ -240,6 +240,9 @@ class _TextFormatter(logging.Formatter):
         return redact(super().format(record))
 
 
+_THIRD_PARTY_LOGGERS = ("fastmcp", "FastMCP", "uvicorn", "uvicorn.access", "uvicorn.error")
+
+
 def configure_logging(fmt: str = "json", level: str = "INFO") -> None:
     """Configure the root logger to write to stderr, redacted, once."""
     root = logging.getLogger()
@@ -256,6 +259,14 @@ def configure_logging(fmt: str = "json", level: str = "INFO") -> None:
     handler.addFilter(RedactingFilter())
     root.addHandler(handler)
     root.setLevel(level)
+
+    # Third-party libraries (FastMCP installs rich console handlers at import
+    # time) must not bypass the JSON formatter or the redaction filter.
+    for name in _THIRD_PARTY_LOGGERS:
+        third_party = logging.getLogger(name)
+        for extra in list(third_party.handlers):
+            third_party.removeHandler(extra)
+        third_party.propagate = True
 
 
 # --------------------------------------------------------------------------
