@@ -10,9 +10,17 @@ import json
 import logging
 import os
 import secrets
+import warnings
 from pathlib import Path
 
-from fastmcp import FastMCP
+# Authlib registers an "always" filter for its own deprecation class when it is
+# imported, so the ignore has to be installed after that and before FastMCP
+# pulls the httpx shim in. It keeps the container log stream to JSON lines.
+import authlib.deprecate  # noqa: E402
+
+warnings.filterwarnings("ignore", category=authlib.deprecate.AuthlibDeprecationWarning)
+
+from fastmcp import FastMCP  # noqa: E402
 from fastmcp.exceptions import ToolError
 from fastmcp.server.auth.auth import AccessToken
 from fastmcp.server.auth.providers.github import GitHubProvider
@@ -339,6 +347,9 @@ def main() -> None:
             port=cfg["port"],
             show_banner=False,
             middleware=telemetry_module.asgi_middleware(telemetry),
+            # uvicorn would otherwise install its own console handlers and
+            # print outside the structured, redacted stream.
+            uvicorn_config={"log_config": None},
         )
     finally:
         telemetry.shutdown()
