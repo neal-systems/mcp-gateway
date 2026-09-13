@@ -191,7 +191,8 @@ def build_app(
     if telemetry is not None:
         # Outermost first: the tool span must wrap the authorization check so
         # a denial is observed as a denial, not as a call that never happened.
-        mcp.add_middleware(telemetry_module.ToolSpanMiddleware(telemetry))
+        known_tools = frozenset().union(*scope.CATALOG.values())
+        mcp.add_middleware(telemetry_module.ToolSpanMiddleware(telemetry, known_tools=known_tools))
     mcp.add_middleware(ScopeMiddleware(allowlist))
 
     def role() -> str | None:
@@ -251,16 +252,22 @@ def build_app(
     async def healthz(request: Request) -> JSONResponse:
         return JSONResponse({"status": "ok"}, headers=NO_STORE_HEADERS)
 
-    @mcp.custom_route("/readyz", methods=["GET"], include_in_schema=False)
-    async def readyz(request: Request) -> JSONResponse:
-        checks = readiness_checks()
-        ready = (
+    def _is_ready(checks: dict[str, bool]) -> bool:
+        """The readiness contract: the first four checks true and no fault
+        injected. Shared by /readyz and the ``gateway.ready`` gauge so the
+        two can never disagree about what "ready" means."""
+        return (
             checks["sample_data"]
             and checks["state_dir_writable"]
             and checks["signing_key"]
             and checks["auth_configured"]
             and not checks["fault_injected"]
         )
+
+    @mcp.custom_route("/readyz", methods=["GET"], include_in_schema=False)
+    async def readyz(request: Request) -> JSONResponse:
+        checks = readiness_checks()
+        ready = _is_ready(checks)
         body = {"status": "ready" if ready else "not_ready", "checks": checks}
         return JSONResponse(
             body, status_code=200 if ready else 503, headers=NO_STORE_HEADERS
@@ -268,7 +275,11 @@ def build_app(
 
     mcp.readiness_checks = readiness_checks
     if telemetry is not None:
-        telemetry.set_readiness_probe(readiness_checks)
+        # `Telemetry.set_readiness_probe` semantics (all values true) are
+        # unchanged; the readiness DECISION is what differs from a plain
+        # `all(checks.values())`, so it is factored through `_is_ready` and
+        # collapsed to the single boolean the gauge should report.
+        telemetry.set_readiness_probe(lambda: {"ready": _is_ready(readiness_checks())})
 
     return mcp
 

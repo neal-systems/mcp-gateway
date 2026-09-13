@@ -276,3 +276,48 @@ def test_telemetry_wraps_requests_and_denied_tool_calls(monkeypatch, tmp_path):
     assert spans["mcp.tool"].attributes["mcp.tool.name"] == "search_runbooks"
     assert "http.request" in spans
     assert app.readiness_checks()["auth_configured"] is False
+
+
+def _ready_gauge_value(tel) -> int | None:
+    for rm in tel.metric_reader.get_metrics_data().resource_metrics:
+        for sm in rm.scope_metrics:
+            for metric in sm.metrics:
+                if metric.name != "gateway.ready":
+                    continue
+                for point in metric.data.data_points:
+                    return point.value
+    return None
+
+
+def test_ready_gauge_matches_readyz_when_fully_configured(tmp_path):
+    """The gateway.ready gauge must agree with /readyz: both apply the same
+    readiness contract (first four checks true and no fault injected), not
+    the weaker all(checks.values()) over all five, which also folds in
+    fault_injected as if it needed to be True."""
+    import telemetry as telemetry_module
+    from starlette.testclient import TestClient
+
+    tel = telemetry_module.configure_telemetry(exporter="memory")
+    app = server.build_app(config(tmp_path), ALLOWLIST, with_auth=True, telemetry=tel)
+
+    assert _ready_gauge_value(tel) == 1
+    with TestClient(server.create_http_app(app, tel)) as client:
+        response = client.get("/readyz")
+    assert response.status_code == 200
+    assert response.json()["status"] == "ready"
+
+
+def test_ready_gauge_matches_readyz_on_fault_injection(tmp_path):
+    import telemetry as telemetry_module
+    from starlette.testclient import TestClient
+
+    cfg = config(tmp_path)
+    cfg["fault_inject"] = "not_ready"
+    tel = telemetry_module.configure_telemetry(exporter="memory")
+    app = server.build_app(cfg, ALLOWLIST, with_auth=True, telemetry=tel)
+
+    assert _ready_gauge_value(tel) == 0
+    with TestClient(server.create_http_app(app, tel)) as client:
+        response = client.get("/readyz")
+    assert response.status_code == 503
+    assert response.json()["status"] == "not_ready"
