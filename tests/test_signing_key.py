@@ -123,7 +123,7 @@ def test_state_dir_owned_by_another_user_is_a_warning_not_a_failure(monkeypatch,
         return real_chmod(path, mode, *args, **kwargs)
 
     monkeypatch.setattr(os, "chmod", chmod_denied)
-    cfg = config(tmp_path)
+    cfg = base_config(tmp_path)
     cfg["state_dir"] = str(state_dir)
     cfg["client_storage"] = str(state_dir / "client_storage")
     cfg["jwt_signing_key_file"] = str(state_dir / "jwt_signing_key")
