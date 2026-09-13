@@ -1,0 +1,18 @@
+# gitleaks configuration: extend the default rules, then allow the deliberate
+# fake sentinel secrets used by the redaction tests and skip local caches.
+title = "mcp-gateway"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Redaction test fixtures are fake by construction; caches are untracked"
+paths = [
+  '''^\.pytest_cache/''',
+  '''^\.venv/''',
+  '''^evidence/raw/''',
+  '''^\.claude/''',
+]
+regexes = [
+  '''SENTINEL''',
+]
