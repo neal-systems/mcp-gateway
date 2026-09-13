@@ -1,6 +1,6 @@
 # Operator runbook: AWS single-node deployment
 
-Status: every step under "Bootstrap once" and below is a live cloud step that has not yet been executed from this repository. Local equivalents (tests/cloud/local_release_drill.sh, scripts/evidence/local_checks.sh) have been executed and are recorded in docs/cloud/EVIDENCE.md.
+Status: every step below was executed once end to end on 2026-09-13 (bootstrap, provisioning, releases A and B, the failed-candidate drill, rollback, restart and reboot, live OAuth, evidence collection, teardown) and is recorded in docs/cloud/EVIDENCE.md. Steps that bit on the first live run are marked in Troubleshooting.
 
 This runbook documents the deployment and operation of the read-only Model Context Protocol (MCP) gateway on Amazon Web Services (AWS) using a reproducible single-node architecture. The deployment runs Docker Compose and Caddy on an Amazon Linux 2023 EC2 host, administered remotely via AWS Systems Manager (SSM) Run Command.
 
