@@ -1,0 +1,190 @@
+name: Deploy
+
+# Opt-in, OIDC-authenticated deploy to the demo instance. Serialized with a
+# single concurrency group so overlapping runs queue instead of racing.
+# The remote work happens over SSM via /opt/mcp-gateway/bin/gateway-release
+# (docs/cloud/CONTRACTS.md sections 5-6); this workflow only assembles the
+# manifest, finds the instance, and dispatches the command.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_id:
+        description: "Release id (sha-<12 hex>), from a release workflow run"
+        required: true
+        type: string
+      image_digest:
+        description: "Image digest (sha256:<64 hex>)"
+        required: true
+        type: string
+      action:
+        description: "Remote gateway-release subcommand to run"
+        required: true
+        type: choice
+        default: deploy
+        options:
+          - deploy
+          - rollback
+          - drill-not-ready
+          - smoke
+          - status
+          - evidence
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deploy-demo
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    environment: demo
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+          release_id="${{ inputs.release_id }}"
+          image_digest="${{ inputs.image_digest }}"
+          if ! [[ "$release_id" =~ ^sha-[0-9a-f]{12}$ ]]; then
+            echo "invalid release_id: $release_id (expected sha-<12 hex>)" >&2
+            exit 2
+          fi
+          if ! [[ "$image_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "invalid image_digest: $image_digest (expected sha256:<64 hex>)" >&2
+            exit 2
+          fi
+
+      - uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gh-deploy-${{ github.run_id }}
+          mask-aws-account-id: true
+
+      - name: Confirm assumed identity
+        run: aws sts get-caller-identity --query Arn --output text
+
+      - name: Find demo instance
+        id: instance
+        run: |
+          set -euo pipefail
+          ids=$(aws ec2 describe-instances \
+            --filters "Name=tag:Project,Values=mcp-gateway-demo" "Name=tag:Name,Values=mcpgw-demo" "Name=instance-state-name,Values=running" \
+            --query 'Reservations[].Instances[].InstanceId' --output text)
+          count=$(wc -w <<< "$ids")
+          if [ "$count" -ne 1 ]; then
+            echo "expected exactly one running mcpgw-demo instance, found $count: $ids" >&2
+            exit 1
+          fi
+          echo "instance_id=$ids" >> "$GITHUB_OUTPUT"
+
+      - name: Build release manifest
+        id: manifest
+        run: |
+          set -euo pipefail
+          built_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          builder="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          manifest_json=$(python3 - "${{ inputs.release_id }}" "${{ inputs.image_digest }}" "${{ github.sha }}" "$built_at" "$builder" <<'PYEOF'
+          import json, sys
+          release_id, digest, git_sha, built_at, builder = sys.argv[1:6]
+          print(json.dumps({
+              "schema": 1,
+              "release_id": release_id,
+              "image": f"ghcr.io/neal-systems/mcp-gateway@{digest}",
+              "git_sha": git_sha,
+              "built_at": built_at,
+              "builder": builder,
+          }))
+          PYEOF
+          )
+          {
+            echo "manifest_json=${manifest_json}"
+            echo "manifest_b64=$(printf '%s' "$manifest_json" | base64 -w0)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch remote command
+        id: remote
+        run: |
+          set -uo pipefail
+          case "${{ inputs.action }}" in
+            deploy)
+              cmd="/opt/mcp-gateway/bin/gateway-release deploy --manifest-b64 ${{ steps.manifest.outputs.manifest_b64 }}"
+              ;;
+            drill-not-ready)
+              cmd="/opt/mcp-gateway/bin/gateway-release deploy --manifest-b64 ${{ steps.manifest.outputs.manifest_b64 }} --drill-not-ready"
+              ;;
+            rollback)
+              cmd="/opt/mcp-gateway/bin/gateway-release rollback"
+              ;;
+            smoke)
+              cmd="/opt/mcp-gateway/bin/gateway-release smoke"
+              ;;
+            status)
+              cmd="/opt/mcp-gateway/bin/gateway-release status"
+              ;;
+            evidence)
+              cmd="/opt/mcp-gateway/bin/gateway-release evidence"
+              ;;
+            *)
+              echo "unknown action: ${{ inputs.action }}" >&2
+              exit 2
+              ;;
+          esac
+          echo "command=$cmd" >> "$GITHUB_OUTPUT"
+
+          set +e
+          bash scripts/cloud/ops/ssm_invoke.sh "${{ steps.instance.outputs.instance_id }}" "$cmd" "gh run ${{ github.run_id }}" > ssm_invocation.json
+          invoke_rc=$?
+          set -e
+
+          command_id=$(python3 -c 'import json;print(json.load(open("ssm_invocation.json")).get("CommandId",""))' 2>/dev/null || echo "")
+          status=$(python3 -c 'import json;print(json.load(open("ssm_invocation.json")).get("Status","Unknown"))' 2>/dev/null || echo "Unknown")
+          stdout_content=$(python3 -c 'import json;print(json.load(open("ssm_invocation.json")).get("StandardOutputContent",""))' 2>/dev/null || echo "")
+          stderr_content=$(python3 -c 'import json;print(json.load(open("ssm_invocation.json")).get("StandardErrorContent",""))' 2>/dev/null || echo "")
+
+          {
+            echo "command_id=$command_id"
+            echo "status=$status"
+            echo "invoke_rc=$invoke_rc"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "--- remote stdout ---"
+          echo "$stdout_content"
+          echo "--- remote stderr ---" >&2
+          echo "$stderr_content" >&2
+
+          if [ "${{ inputs.action }}" = "drill-not-ready" ]; then
+            if [ "$status" = "Failed" ] && [ "$invoke_rc" = "3" ]; then
+              echo "drill-not-ready produced the expected Failed/exit-3 outcome (fault injection verified)"
+              exit 0
+            fi
+            echo "drill-not-ready expected Status=Failed and exit code 3, got status=$status rc=$invoke_rc" >&2
+            exit 1
+          fi
+
+          if [ "$status" != "Success" ]; then
+            echo "action ${{ inputs.action }} did not succeed: status=$status rc=$invoke_rc" >&2
+            exit 1
+          fi
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "### Deploy summary"
+            echo "- release_id: ${{ inputs.release_id }}"
+            echo "- image_digest: ${{ inputs.image_digest }}"
+            echo "- action: ${{ inputs.action }}"
+            echo "- instance_id: ${{ steps.instance.outputs.instance_id }}"
+            echo "- ssm_command_id: ${{ steps.remote.outputs.command_id }}"
+            echo "- remote_status: ${{ steps.remote.outputs.status }}"
+            echo '```json'
+            cat ssm_invocation.json 2>/dev/null || echo '{}'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

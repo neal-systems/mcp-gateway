@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - "feat/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r app/requirements.txt
+      - name: Run test suite
+        run: python -m pytest -q
+      - name: Byte-compile app
+        run: python -m compileall -q app
+
+  config-checks:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Materialize config.env from the example (placeholders only)
+        run: cp config.example.env config.env
+      - name: Validate base compose file
+        run: docker compose -f docker-compose.yml config -q
+      - name: Validate compose with local override
+        run: docker compose -f docker-compose.yml -f compose.local.yml config -q
+      - name: Check config.example.env against app config names
+        run: python scripts/ci/check_example_env.py
+
+  terraform:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        if: hashFiles('infra/**/*.tf') != ''
+        with:
+          terraform_version: 1.16.2
+      - name: terraform fmt
+        if: hashFiles('infra/**/*.tf') != ''
+        run: terraform fmt -check -recursive infra/
+      - name: terraform validate bootstrap
+        if: hashFiles('infra/aws/bootstrap/**/*.tf') != ''
+        working-directory: infra/aws/bootstrap
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate
+      - name: terraform validate demo
+        if: hashFiles('infra/aws/demo/**/*.tf') != ''
+        working-directory: infra/aws/demo
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate
+
+  container:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: hadolint/hadolint-action@06be81baf89a55ffd0e24b8f04a4185738dd3387 # v3.5.0
+        with:
+          dockerfile: app/Dockerfile
+          # DL3066 (info: non-numeric USER) is a deliberate, pre-existing
+          # choice in app/Dockerfile (out of scope for this work package);
+          # only warning-or-above findings fail the job.
+          failure-threshold: warning
+      - name: Build image
+        run: docker build -t mcp-gateway:ci ./app
+      - name: Container smoke test
+        run: scripts/ci/container_smoke.sh mcp-gateway:ci
+
+  workflows-and-scripts:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: actionlint
+        run: |
+          docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -color
+      - name: shellcheck
+        run: |
+          mapfile -t files < <(find . -type f -name '*.sh' -not -path './.git/*')
+          if [ -e scripts/cloud/instance/gateway-release ]; then
+            files+=(scripts/cloud/instance/gateway-release)
+          fi
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "no shell scripts found"
+            exit 0
+          fi
+          docker run --rm -v "$PWD:/repo" -w /repo koalaman/shellcheck:v0.11.0 "${files[@]}"
+      - name: gitleaks
+        run: |
+          docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:v8.30.1 \
+            detect --source /repo --no-git -v --redact
