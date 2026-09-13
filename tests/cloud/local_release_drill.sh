@@ -294,8 +294,8 @@ JSON
 mkdir -p "$TMP/ssmroot"
 if GATEWAY_RELEASE_ROOT="$TMP/ssmroot" GATEWAY_CONFIG_FILE="$TMP/ssm-config.env" \
   GATEWAY_STATE_ROOT="$TMP/srv" GATEWAY_CONFIG_SOURCE=ssm GATEWAY_SSM_FAKE_JSON="$TMP/fake-ssm.json" \
-  GATEWAY_IMAGE_ALLOW_LOCAL=1 GATEWAY_INSTANCE_ENV="$TMP/no-instance-env" \
-  bash -c 'source <(sed -n "/^render_config()/,/^}/p" "$0"); CONFIG_SOURCE=ssm; CONFIG_FILE="$GATEWAY_CONFIG_FILE"; SSM_PREFIX=/mcp-gateway/demo/; log(){ :; }; die(){ echo "$2" >&2; exit "$1"; }; need(){ :; }; render_config test-rid' "$GATEWAY_RELEASE_BIN" 2>"$TMP/ssm-render.err" \
+  GATEWAY_INSTANCE_ENV="$TMP/no-instance-env" \
+  "$GATEWAY_RELEASE_BIN" render-config test-rid >/dev/null 2>"$TMP/ssm-render.err" \
   && grep -q '^GATEWAY_OPERATOR_GITHUB_IDS=111111111$' "$TMP/ssm-config.env" \
   && grep -q '^GITHUB_CLIENT_SECRET=drill-client-value$' "$TMP/ssm-config.env" \
   && grep -q '^GATEWAY_BASE_URL=https://drill.example$' "$TMP/ssm-config.env" \

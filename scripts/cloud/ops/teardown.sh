@@ -59,7 +59,8 @@ if [ "$confirmed" != "true" ]; then
 fi
 
 echo "running terraform destroy for infra/aws/demo" >&2
-terraform -chdir="${REPO_ROOT}/infra/aws/demo" destroy
+# --yes was already required above; Terraform must not prompt again (no TTY under automation).
+terraform -chdir="${REPO_ROOT}/infra/aws/demo" destroy -auto-approve -input=false
 
 echo "Residual inventory after destroy:" >&2
 residual=$(inventory_json)

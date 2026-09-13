@@ -1,6 +1,6 @@
 # Operator runbook: AWS single-node deployment
 
-Status: every step under "Bootstrap once" and below is a live cloud step that has not yet been executed from this repository. Local equivalents (tests/cloud/local_release_drill.sh, scripts/evidence/local_checks.sh) have been executed and are recorded in docs/cloud/EVIDENCE.md.
+Status: every step below was executed once end to end on 2026-09-13 (bootstrap, provisioning, releases A and B, the failed-candidate drill, rollback, restart and reboot, live OAuth, evidence collection, teardown) and is recorded in docs/cloud/EVIDENCE.md. Steps that bit on the first live run are marked in Troubleshooting.
 
 This runbook documents the deployment and operation of the read-only Model Context Protocol (MCP) gateway on Amazon Web Services (AWS) using a reproducible single-node architecture. The deployment runs Docker Compose and Caddy on an Amazon Linux 2023 EC2 host, administered remotely via AWS Systems Manager (SSM) Run Command.
 
@@ -146,6 +146,18 @@ Triggered by pushing tag v* or dispatching .github/workflows/release.yml:
 3. Derives release_id as sha-<12 hex digits> from commit SHA.
 4. Captures image_digest as sha256:<64 hex digits> from docker build-push-action.
 5. Emits release-manifest.json artifact and summary. Latest tags are never used.
+
+### First publish: make the package public
+
+GHCR creates a container package as private the first time a workflow pushes
+it, even from a public repository. The demo host pulls anonymously on
+purpose (no registry credential lives on the instance), so the very first
+deploy fails at `docker pull` with "unauthorized" until the package is made
+public once, by hand, at
+https://github.com/orgs/neal-systems/packages/container/mcp-gateway/settings
+(Danger Zone, Change package visibility, Public). GitHub has no API for this
+switch. It stays public for every later push. Observed on the first live
+run: deploy run 34774294877, exit 5.
 
 ### Deployment Workflow (deploy.yml)
 
@@ -378,7 +390,7 @@ Per docs/cloud/CONTRACTS.md section 5:
 ### Prerequisite Missing (Exit 5)
 
 - Symptom: Command exits with code 5.
-- Cause: Docker daemon stopped, egress to GHCR failed, image digest missing, or instance IAM role cannot read /mcp-gateway/demo/.
+- Cause: Docker daemon stopped, egress to GHCR failed, image digest missing, the GHCR package still private after its first publish (pull says "unauthorized"), or instance IAM role cannot read /mcp-gateway/demo/.
 - Resolution: Check Docker with systemctl status docker. Verify image on GHCR with docker manifest inspect. Run scripts/cloud/ops/preflight.sh to check SSM parameters and credentials.
 
 ### Candidate Never Ready (Exit 3)

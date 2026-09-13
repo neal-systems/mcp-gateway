@@ -53,7 +53,7 @@ for path in "/.well-known/oauth-protected-resource" "/.well-known/oauth-authoriz
 done
 
 tls_ok="false"
-if curl -fsS --fail-with-body --max-time 10 -o /dev/null "${base}/healthz" 2>/dev/null; then
+if curl -sS --fail-with-body --max-time 10 -o /dev/null "${base}/healthz" 2>/dev/null; then
   tls_ok="true"
 fi
 

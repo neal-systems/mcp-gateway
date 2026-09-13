@@ -64,7 +64,7 @@ The following matrix documents callers, reachable destinations, credentials, and
 The single-node architecture prioritizes simplicity, low cost, and reproducibility while acknowledging specific trade-offs:
 
 - Single Node: All services run on one t3.small EC2 host without container orchestration. Physical host failure requires manual re-provisioning via Terraform to launch a replacement instance and re-attach the state volume.
-- Short Interruption on Release: Upgrades execute a health-gated cutover where the old container stops before the replacement candidate starts. This creates a brief, measured service interruption (about three seconds in the local drill; the live value is recorded in releases.log and by interruption_probe.sh). Zero downtime is not claimed.
+- Short Interruption on Release: Upgrades execute a health-gated cutover where the old container stops before the replacement candidate starts. This creates a brief, measured service interruption: 3.1 to 3.5 s on the host's release log and 3.11 s measured from the internet during the live A-to-B upgrade; a failed candidate costs the 60 s readiness timeout plus the rollback (61 s measured). Zero downtime is not claimed.
 - Teardown Discards State: The dedicated EBS state volume has no prevent_destroy lifecycle rule. Running terraform destroy removes the volume, discarding the generated JWT signing key and client OAuth registrations.
 - No Automated Failover: There is no standby instance, secondary replica, or load balancer health-check rerouting.
 - Ephemeral sslip.io Hostname: The derived sslip.io hostname depends on the allocated Elastic IP. Re-allocating the Elastic IP changes the domain, requiring updates to the OAuth callback URL.
