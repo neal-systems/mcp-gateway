@@ -591,11 +591,21 @@ sys.exit(0 if out["result"] == "pass" else 1)
 
 do_evidence() {
   need python3
+  # SSM Run Command returns at most about 24 KB of inline output, so the
+  # bundle is bounded: --lines N app log lines (default 40), each cut to 400
+  # characters. Ask for fewer lines rather than more if a bundle is cut off.
+  local lines=40
+  while [ $# -gt 0 ]; do
+    case "$1" in
+    --lines) lines="${2:-40}"; shift 2 ;;
+    *) die 2 "unknown argument: $1" ;;
+    esac
+  done
   local status_json log_lines app_logs
   status_json="$(do_status)"
   log_lines=""
   [ -f "$RELEASES_LOG" ] && log_lines="$(tail -n 20 "$RELEASES_LOG")"
-  app_logs="$(docker logs --tail 200 "$APP_CONTAINER" 2>&1 || true)"
+  app_logs="$(docker logs --tail "$lines" "$APP_CONTAINER" 2>&1 | cut -c1-400 || true)"
 
   python3 -c '
 import json, re, sys
@@ -634,7 +644,7 @@ def scrub(text):
     return text
 
 
-lines = [scrub(line) for line in raw_app.splitlines()][-200:]
+lines = [scrub(line) for line in raw_app.splitlines()]
 print(json.dumps({"status": status, "releases": releases, "app_logs": lines},
                  sort_keys=True))
 ' "$status_json" "$log_lines" "$app_logs"
@@ -650,7 +660,7 @@ usage: gateway-release <subcommand>
   resume
   status
   smoke
-  evidence
+  evidence [--lines N]
   render-config <release_id>   re-render the runtime env file only
 EOF
   exit 2
@@ -677,7 +687,7 @@ main() {
   status) do_status ;;
   render-config) render_config "${1:?release id required}"; printf '{"action":"render-config","outcome":"rendered"}\n' ;;
   smoke) do_smoke ;;
-  evidence) do_evidence ;;
+  evidence) do_evidence "$@" ;;
   -h | --help | help) usage ;;
   *) die 2 "unknown subcommand: $sub" ;;
   esac
