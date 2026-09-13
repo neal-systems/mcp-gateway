@@ -17,3 +17,8 @@ output "oidc_provider_arn" {
   description = "GitHub Actions OIDC provider ARN, created here or reused."
   value       = local.oidc_provider_arn
 }
+
+output "github_subject" {
+  description = "The exact OIDC subject the deploy role trusts; compare with the subject printed by the deploy workflow."
+  value       = local.github_subject
+}

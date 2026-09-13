@@ -2,7 +2,17 @@ locals {
   # A workflow job bound to a GitHub environment presents an environment-shaped
   # subject. It does NOT also present a ref-shaped subject, so adding a `ref:`
   # condition alongside this one would make the trust policy unsatisfiable.
-  github_subject = "repo:${var.github_repo}:environment:${var.github_environment}"
+  #
+  # Repositories created after 2026-07-15 (this one: 2026-09-03) carry the
+  # immutable subject with owner and repository ids embedded; the legacy
+  # name-only form never matches their tokens. The ids are public, not secret.
+  github_owner = split("/", var.github_repo)[0]
+  github_name  = split("/", var.github_repo)[1]
+  github_subject = (
+    var.github_subject_format == "immutable"
+    ? "repo:${local.github_owner}@${var.github_owner_id}/${local.github_name}@${var.github_repo_id}:environment:${var.github_environment}"
+    : "repo:${var.github_repo}:environment:${var.github_environment}"
+  )
 }
 
 data "aws_iam_policy_document" "github_deploy_trust" {
@@ -65,15 +75,14 @@ data "aws_iam_policy_document" "github_deploy" {
     }
   }
 
-  # Command results are addressed by command id, which does not exist until the
-  # command is sent, so these two cannot be resource-scoped.
+  # A command result is addressed by command id, which does not exist until
+  # the command is sent, so this one cannot be resource-scoped. List access
+  # is deliberately absent: it would let the role read the output of
+  # commands sent to unrelated instances in the account.
   statement {
-    sid    = "ReadCommandResults"
-    effect = "Allow"
-    actions = [
-      "ssm:GetCommandInvocation",
-      "ssm:ListCommandInvocations",
-    ]
+    sid       = "ReadCommandResults"
+    effect    = "Allow"
+    actions   = ["ssm:GetCommandInvocation"]
     resources = ["*"]
   }
 

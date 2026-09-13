@@ -47,6 +47,16 @@ def upsert(path, record):
     else:
         checks.append(record)
     write_manifest(path, checks)
+def git_dirty():
+    """True when tracked files differ from HEAD, so a run on an uncommitted tree is visible."""
+    try:
+        out = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"],
+                             capture_output=True, text=True, check=False)
+    except OSError:
+        return None
+    return bool(out.stdout.strip()) if out.returncode == 0 else None
+
+
 def git_head():
     try:
         return subprocess.check_output(["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True).strip()
@@ -87,6 +97,7 @@ def run_mode(args, root, manifest_path, raw_dir):
         "finished_at": finished,
         "duration_s": duration,
         "git_sha": git_head(),
+        "git_dirty": git_dirty(),
         "image_digest": args.image_digest,
         "environment": args.env,
         "command": shlex.join(cmd),
@@ -107,6 +118,7 @@ def mark_mode(args, manifest_path):
         "finished_at": now,
         "duration_s": 0,
         "git_sha": git_head(),
+        "git_dirty": git_dirty(),
         "image_digest": args.image_digest,
         "environment": args.env,
         "command": args.command or "",

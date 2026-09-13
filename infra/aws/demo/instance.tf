@@ -21,6 +21,11 @@ resource "aws_instance" "this" {
   iam_instance_profile   = aws_iam_instance_profile.instance.name
   availability_zone      = local.az
 
+  # cloud-init installs Docker over the internet at first boot, and the
+  # Elastic IP is associated only after the instance exists. A launch-time
+  # public address covers that window; the EIP replaces it once attached.
+  associate_public_ip_address = true
+
   # IMDSv2 only, and one hop: a container on this host cannot reach the
   # instance credentials through the metadata service.
   metadata_options {

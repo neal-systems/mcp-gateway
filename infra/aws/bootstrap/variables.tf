@@ -34,3 +34,37 @@ variable "state_noncurrent_expiration_days" {
   type        = number
   default     = 30
 }
+
+variable "github_owner_id" {
+  description = <<-EOT
+    Numeric id of the GitHub owner (organisation or user). Repositories created
+    after 2026-07-15 present an immutable OIDC subject that embeds the owner
+    and repository ids: repo:<owner>@<owner_id>/<repo>@<repo_id>:environment:<env>.
+    Read it with: gh api orgs/<owner> --jq .id (or gh api users/<owner>).
+  EOT
+  type        = number
+  default     = 324300420
+}
+
+variable "github_repo_id" {
+  description = "Numeric id of the repository: gh api repos/<owner>/<repo> --jq .id"
+  type        = number
+  default     = 1355437034
+}
+
+variable "github_subject_format" {
+  description = <<-EOT
+    "immutable" (default; repositories created after 2026-07-15 or opted in)
+    builds repo:<owner>@<owner_id>/<repo>@<repo_id>:environment:<env>.
+    "legacy" builds repo:<owner>/<repo>:environment:<env> for older
+    repositories that have not opted in. The deploy workflow prints the
+    subject the live token actually carries so this can be checked.
+  EOT
+  type        = string
+  default     = "immutable"
+
+  validation {
+    condition     = contains(["immutable", "legacy"], var.github_subject_format)
+    error_message = "github_subject_format must be \"immutable\" or \"legacy\"."
+  }
+}

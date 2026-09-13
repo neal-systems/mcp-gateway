@@ -11,6 +11,11 @@ One line each: what, why, cost impact.
 - **No thumbprint pinned on the GitHub OIDC provider** -- IAM validates
   `token.actions.githubusercontent.com` against its own trusted CA set; a pinned
   thumbprint is a rotation outage waiting to happen. No cost impact.
+- **Immutable OIDC subject `repo:<owner>@<owner_id>/<repo>@<repo_id>:environment:demo`**
+  -- GitHub issues it for repositories created after 2026-07-15 (this one:
+  2026-09-03); the name-only form would never match. Found by review; the
+  deploy workflow prints the live subject before assuming the role. No cost
+  impact.
 - **Trust policy conditions on `aud` and `sub` only, with no `ref:` condition**
   -- a job bound to a GitHub environment presents the environment-shaped subject
   and not a ref-shaped one, so a `ref:` condition alongside it would make the
@@ -19,9 +24,10 @@ One line each: what, why, cost impact.
   instances are separate resource types, and the `ssm:resourceTag/Project`
   condition can only ever be satisfied by the instance, so one combined
   statement would deny the document. No cost impact.
-- **`ssm:GetCommandInvocation` / `ListCommandInvocations` on `*`** -- a command
-  id does not exist until the command is sent, so there is nothing to scope to.
-  No cost impact.
+- **`ssm:GetCommandInvocation` on `*`, no `ListCommandInvocations`** -- a command
+  id does not exist until the command is sent, so there is nothing to scope to;
+  list access was removed after review because it would expose the output of
+  commands sent to unrelated instances. No cost impact.
 - **`kms:Decrypt` scoped to the `alias/aws/ssm` target key plus a
   `kms:ViaService` condition** -- the alias lookup ties the grant to the real
   key, and the condition keeps it unusable for anything but Parameter Store.
@@ -78,3 +84,18 @@ One line each: what, why, cost impact.
   through `config.env`** -- the env file is rendered from SSM and outlives the
   drill, so a flag written there could survive into a real release. No cost
   impact.
+- **`associate_public_ip_address = true` on the instance** -- cloud-init needs
+  the internet to install Docker before the Elastic IP association exists
+  (there is no NAT). Public IPv4 is billed per address-hour either way; the
+  launch address is released when the EIP attaches.
+- **bootstrap waits up to ten minutes for the state volume** -- the attachment
+  is a separate resource created after the instance; giving up or formatting
+  the wrong disk were the alternatives. No cost impact.
+- **docker.service drop-in `RequiresMountsFor=/srv/mcp-gateway`** -- Docker
+  restarts `unless-stopped` containers itself, and with `nofail` on the mount
+  it could have started the app over the root disk under the mount point. A
+  missing mount now stops Docker instead. No cost impact.
+- **A drill candidate gets `<release_id>-drill`, and a deploy that would
+  overwrite the known-good release's directory with a different image is
+  refused (exit 2)** -- otherwise a failed candidate under the current id
+  left nothing to roll back to. Found by review. No cost impact.

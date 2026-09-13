@@ -19,7 +19,9 @@ environment needs before it can have any state of its own.
   role's trust policy is then the only boundary. Confirm you are authorised to
   attach a role to a provider you do not own.
 - **IAM role `mcpgw-demo-github-deploy`**, assumable only by a job whose OIDC
-  subject is exactly `repo:neal-systems/mcp-gateway:environment:demo`, with a
+  subject is exactly `repo:neal-systems@324300420/mcp-gateway@1355437034:environment:demo`
+  (the immutable form GitHub issues for repositories created after 2026-07-15;
+  set `github_subject_format = "legacy"` for an older repository), with a
   one-hour maximum session. It may send `AWS-RunShellScript` to instances tagged
   `Project=mcp-gateway-demo`, read the results, and describe instances. Nothing
   else.

@@ -64,9 +64,9 @@ Passing secrets via Terraform variables or user-data was rejected because it lea
 
 ## 6. GitHub Actions OIDC Bound to Environment Without Ref Conditions
 
-GitHub Actions assumes the AWS deployment role using OpenID Connect authenticated against the subject repo:neal-systems/mcp-gateway:environment:demo without combining it with a ref condition.
+GitHub Actions assumes the AWS deployment role using OpenID Connect authenticated against the subject repo:neal-systems@324300420/mcp-gateway@1355437034:environment:demo without combining it with a ref condition.
 
-GitHub Actions environment-protected jobs emit an OIDC subject formatted as repo:<org>/<repo>:environment:<env>, enabling secure authorization to demo without long-lived AWS credentials.
+GitHub Actions environment-bound jobs emit an OIDC subject of the form repo:<owner>@<owner_id>/<repo>@<repo_id>:environment:<env> for repositories created after 2026-07-15 (older repositories keep repo:<owner>/<repo>:environment:<env> unless they opt in). This repository was created on 2026-09-03, so the trust policy uses the immutable form; the deploy workflow prints the live subject before assuming the role so a mismatch is diagnosed in one line.
 
 Static IAM keys pose leakage risks, while combining the environment subject with a branch ref condition creates an unsatisfiable trust policy: a job bound to an environment presents the environment-shaped subject claim, not the ref-shaped one, so both conditions can never be true at once.
 

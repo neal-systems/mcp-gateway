@@ -29,7 +29,13 @@ die() {
 install_docker() {
   if ! command -v docker >/dev/null 2>&1; then
     log "installing docker"
-    dnf install -y docker >&2
+    local try
+    for try in 1 2 3 4 5 6; do
+      dnf install -y docker >&2 && break
+      [ "$try" = "6" ] && die "dnf install docker failed after 6 attempts"
+      log "dnf install docker failed (attempt $try); retrying in 20s"
+      sleep 20
+    done
   else
     log "docker already installed"
   fi
@@ -91,7 +97,17 @@ find_state_device() {
 
 prepare_state_volume() {
   local dev uuid
-  dev="$(find_state_device)" || die "no separate state volume found"
+  # The volume attachment is a separate Terraform resource created after the
+  # instance exists, so at first boot the device may not be there yet. Wait
+  # up to ten minutes rather than formatting the wrong disk or giving up.
+  local attempt dev=""
+  for attempt in $(seq 1 120); do
+    dev="$(find_state_device 2>/dev/null || true)"
+    [ -n "$dev" ] && break
+    [ "$attempt" = "1" ] && log "waiting for the state volume to attach"
+    sleep 5
+  done
+  [ -n "$dev" ] || die "no separate state volume found after 10 minutes"
   log "state volume device: $dev"
 
   if [ -z "$(blkid -o value -s TYPE "$dev" 2>/dev/null || true)" ]; then
@@ -176,6 +192,15 @@ TimeoutStartSec=300
 [Install]
 WantedBy=multi-user.target
 EOF
+  # Docker restarts containers marked unless-stopped on its own. It must
+  # not do that before the state volume is mounted, or the app would write
+  # its key and registrations to the root disk under the mount point. With
+  # this drop-in, a missing mount stops docker.service instead (fail closed).
+  mkdir -p /etc/systemd/system/docker.service.d
+  cat >/etc/systemd/system/docker.service.d/10-mcp-gateway-state.conf <<UNIT
+[Unit]
+RequiresMountsFor=${STATE_ROOT}
+UNIT
   systemctl daemon-reload >&2
   systemctl enable mcp-gateway.service >&2
 }

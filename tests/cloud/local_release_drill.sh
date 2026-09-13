@@ -422,9 +422,22 @@ fi
 
 # --------------------------------------------------- 7. fault-injection drill
 
+# A candidate under the known-good release id with a different image must be
+# refused (exit 2) so a failed candidate can never overwrite its own fallback.
+rc="$(gr deploy --manifest-b64 "$(manifest_b64 drill-b "$IMAGE_A")")"
+expect_exit deploy.same_id_refused 2 "$rc" "known-good id with a different image is refused"
+if [ "$(json_field "$TMP/opt/known-good.json" release_id)" = "drill-b" ] \
+  && [ "$(basename "$(readlink -f "$TMP/opt/current")")" = "drill-b" ]; then
+  record deploy.same_id_kept PASS "known-good and current untouched by the refused deploy"
+else
+  record deploy.same_id_kept FAIL "the refused deploy changed known-good or current"
+fi
+
+# The drill candidate gets its own id (<release_id>-drill) so it never
+# overwrites the release directory it must fall back to.
 rc="$(gr deploy --manifest-b64 "$(manifest_b64 drill-fault "$IMAGE_B")" --drill-not-ready)"
 if grep -q 'GATEWAY_FAULT_INJECT: "not_ready"' \
-  "$TMP/opt/releases/drill-fault/override.yml" 2>/dev/null; then
+  "$TMP/opt/releases/drill-fault-drill/override.yml" 2>/dev/null; then
   record drill.override_rendered PASS "fault flag is in a compose override, not the env file"
 else
   record drill.override_rendered FAIL "no compose override carrying the fault flag"

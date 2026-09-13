@@ -96,7 +96,7 @@ by `scripts/cloud/put_parameter.sh` reading from a local file or stdin.
 
 Roles: `mcpgw-demo-instance` (SSM core, `ssm:GetParameter*` on the prefix,
 KMS decrypt via the default `aws/ssm` key, nothing else);
-`mcpgw-demo-github-deploy` (OIDC trust for `repo:neal-systems/mcp-gateway:environment:demo`
+`mcpgw-demo-github-deploy` (OIDC trust for `repo:neal-systems@324300420/mcp-gateway@1355437034:environment:demo`
 only; `ssm:SendCommand` limited to document `AWS-RunShellScript` and instances
 tagged `Project=mcp-gateway-demo`, `ssm:GetCommandInvocation`,
 `ssm:ListCommandInvocations`, `ec2:DescribeInstances`). Bootstrap and

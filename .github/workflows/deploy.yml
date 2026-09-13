@@ -43,14 +43,25 @@ jobs:
     runs-on: ubuntu-24.04
     environment: demo
     timeout-minutes: 20
+    # Workflow inputs are untrusted text. They reach the shell only through
+    # environment variables (never via ${{ }} inside a run block), so a value
+    # like $(cmd) is data, not code, and validation below sees the real value.
+    env:
+      INPUT_RELEASE_ID: ${{ inputs.release_id }}
+      INPUT_IMAGE_DIGEST: ${{ inputs.image_digest }}
+      INPUT_ACTION: ${{ inputs.action }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Validate inputs
         run: |
           set -euo pipefail
-          release_id="${{ inputs.release_id }}"
-          image_digest="${{ inputs.image_digest }}"
+          release_id="$INPUT_RELEASE_ID"
+          image_digest="$INPUT_IMAGE_DIGEST"
+          case "$INPUT_ACTION" in
+            deploy|rollback|drill-not-ready|smoke|status|evidence) ;;
+            *) echo "invalid action" >&2; exit 2 ;;
+          esac
           if ! [[ "$release_id" =~ ^sha-[0-9a-f]{12}$ ]]; then
             echo "invalid release_id: $release_id (expected sha-<12 hex>)" >&2
             exit 2
@@ -59,6 +70,22 @@ jobs:
             echo "invalid image_digest: $image_digest (expected sha256:<64 hex>)" >&2
             exit 2
           fi
+
+      # Print the subject claim the live token carries (not the token) so a
+      # trust-policy mismatch is diagnosed in one line, not by a failed assume.
+      - name: Show OIDC subject
+        run: |
+          set -euo pipefail
+          token=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | python3 -c 'import json,sys;print(json.load(sys.stdin)["value"])')
+          python3 - "$token" <<'PY'
+          import base64, json, sys
+          payload = sys.argv[1].split(".")[1]
+          payload += "=" * (-len(payload) % 4)
+          claims = json.loads(base64.urlsafe_b64decode(payload))
+          print("oidc sub:", claims.get("sub"))
+          print("oidc aud:", claims.get("aud"))
+          PY
 
       - uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
         with:
@@ -90,7 +117,7 @@ jobs:
           set -euo pipefail
           built_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           builder="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          manifest_json=$(python3 - "${{ inputs.release_id }}" "${{ inputs.image_digest }}" "${{ github.sha }}" "$built_at" "$builder" <<'PYEOF'
+          manifest_json=$(python3 - "$INPUT_RELEASE_ID" "$INPUT_IMAGE_DIGEST" "$GITHUB_SHA" "$built_at" "$builder" <<'PYEOF'
           import json, sys
           release_id, digest, git_sha, built_at, builder = sys.argv[1:6]
           print(json.dumps({
@@ -112,7 +139,7 @@ jobs:
         id: remote
         run: |
           set -uo pipefail
-          case "${{ inputs.action }}" in
+          case "$INPUT_ACTION" in
             deploy)
               cmd="/opt/mcp-gateway/bin/gateway-release deploy --manifest-b64 ${{ steps.manifest.outputs.manifest_b64 }}"
               ;;
@@ -132,14 +159,14 @@ jobs:
               cmd="/opt/mcp-gateway/bin/gateway-release evidence"
               ;;
             *)
-              echo "unknown action: ${{ inputs.action }}" >&2
+              echo "unknown action: $INPUT_ACTION" >&2
               exit 2
               ;;
           esac
           echo "command=$cmd" >> "$GITHUB_OUTPUT"
 
           set +e
-          bash scripts/cloud/ops/ssm_invoke.sh "${{ steps.instance.outputs.instance_id }}" "$cmd" "gh run ${{ github.run_id }}" > ssm_invocation.json
+          bash scripts/cloud/ops/ssm_invoke.sh "${{ steps.instance.outputs.instance_id }}" "$cmd" "gh run $GITHUB_RUN_ID" > ssm_invocation.json
           invoke_rc=$?
           set -e
 
@@ -159,7 +186,7 @@ jobs:
           echo "--- remote stderr ---" >&2
           echo "$stderr_content" >&2
 
-          if [ "${{ inputs.action }}" = "drill-not-ready" ]; then
+          if [ "$INPUT_ACTION" = "drill-not-ready" ]; then
             if [ "$status" = "Failed" ] && [ "$invoke_rc" = "3" ]; then
               echo "drill-not-ready produced the expected Failed/exit-3 outcome (fault injection verified)"
               exit 0
@@ -169,7 +196,7 @@ jobs:
           fi
 
           if [ "$status" != "Success" ]; then
-            echo "action ${{ inputs.action }} did not succeed: status=$status rc=$invoke_rc" >&2
+            echo "action $INPUT_ACTION did not succeed: status=$status rc=$invoke_rc" >&2
             exit 1
           fi
 
@@ -178,13 +205,13 @@ jobs:
         run: |
           {
             echo "### Deploy summary"
-            echo "- release_id: ${{ inputs.release_id }}"
-            echo "- image_digest: ${{ inputs.image_digest }}"
-            echo "- action: ${{ inputs.action }}"
+            echo "- release_id: $INPUT_RELEASE_ID"
+            echo "- image_digest: $INPUT_IMAGE_DIGEST"
+            echo "- action: $INPUT_ACTION"
             echo "- instance_id: ${{ steps.instance.outputs.instance_id }}"
             echo "- ssm_command_id: ${{ steps.remote.outputs.command_id }}"
             echo "- remote_status: ${{ steps.remote.outputs.status }}"
             echo '```json'
-            cat ssm_invocation.json 2>/dev/null || echo '{}'
+            python3 scripts/cloud/ops/redact.py < ssm_invocation.json 2>/dev/null || echo '{}'
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
