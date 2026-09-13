@@ -18,12 +18,16 @@ from fastmcp.server.auth.auth import AccessToken
 from fastmcp.server.auth.providers.github import GitHubProvider
 from fastmcp.server.dependencies import get_access_token
 from fastmcp.server.middleware import Middleware, MiddlewareContext
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 import scope
 from scope import ConfigError
 
 logger = logging.getLogger("mcp_gateway")
 PLACEHOLDER = "<SET_BY_OPERATOR>"
+MIN_SIGNING_KEY_LENGTH = 32
+NO_STORE_HEADERS = {"Cache-Control": "no-store"}
 
 
 def _credential(name: str) -> str:
@@ -34,14 +38,25 @@ def _credential(name: str) -> str:
 
 
 def load_config() -> dict:
+    state_dir = os.environ.get("GATEWAY_STATE_DIR", "/data/state")
+    explicit_client_storage = os.environ.get("GATEWAY_CLIENT_STORAGE")
+    fault_inject = os.environ.get("GATEWAY_FAULT_INJECT", "").strip() or None
     return {
         "base_url": os.environ.get("GATEWAY_BASE_URL", "https://gateway.example.com"),
         "github_client_id": _credential("GITHUB_CLIENT_ID"),
         "github_client_secret": _credential("GITHUB_CLIENT_SECRET"),
         "jwt_signing_key": _credential("GATEWAY_JWT_SIGNING_KEY"),
-        "client_storage": os.environ.get(
-            "GATEWAY_CLIENT_STORAGE", "/data/client_storage"
+        "state_dir": state_dir,
+        "client_storage": (
+            explicit_client_storage
+            if explicit_client_storage
+            else str(Path(state_dir) / "client_storage")
         ),
+        "jwt_signing_key_file": os.environ.get(
+            "GATEWAY_JWT_SIGNING_KEY_FILE", str(Path(state_dir) / "jwt_signing_key")
+        ),
+        "release_id": os.environ.get("GATEWAY_RELEASE_ID", "dev"),
+        "fault_inject": fault_inject,
         "host": os.environ.get("GATEWAY_HOST", "127.0.0.1"),
         "port": int(os.environ.get("GATEWAY_PORT", "8080")),
         "sample_data": Path(
@@ -53,11 +68,10 @@ def load_config() -> dict:
 
 
 def credentials_are_placeholders(cfg: dict) -> bool:
-    return PLACEHOLDER in (
-        cfg["github_client_id"],
-        cfg["github_client_secret"],
-        cfg["jwt_signing_key"],
-    )
+    """OAuth client id/secret fail closed. The signing key does NOT belong
+    here: a placeholder signing key selects the generate-once path in
+    `_resolve_signing_key`, it is never an error on its own."""
+    return PLACEHOLDER in (cfg["github_client_id"], cfg["github_client_secret"])
 
 
 class AllowlistedGitHubProvider(GitHubProvider):
@@ -118,11 +132,37 @@ def _read_sample_data(path: Path) -> dict:
     return data
 
 
+def _ensure_dir_0700(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    os.chmod(path, 0o700)
+
+
+def _state_dir_writable(state_dir: Path) -> bool:
+    probe = state_dir / f".writable-probe-{os.getpid()}-{secrets.token_hex(4)}"
+    try:
+        probe.write_text("", encoding="utf-8")
+        probe.unlink()
+        return True
+    except OSError:
+        return False
+
+
 def build_app(cfg: dict, allowlist: dict[str, str], with_auth: bool = True) -> FastMCP:
     if not allowlist:
         raise ConfigError("refusing to build a server with an empty allowlist")
     data = _read_sample_data(cfg["sample_data"])
-    auth = _build_auth(cfg, allowlist) if with_auth else None
+
+    state_dir = Path(cfg["state_dir"])
+    _ensure_dir_0700(state_dir)
+
+    signing_key_present = False
+    if with_auth:
+        auth, signing_key_present = _build_auth(cfg, allowlist)
+    else:
+        auth = None
+
+    fault_injected = cfg.get("fault_inject") == "not_ready"
+
     mcp = FastMCP(name="read-only-mcp-gateway", auth=auth)
     mcp.add_middleware(ScopeMiddleware(allowlist))
 
@@ -169,31 +209,97 @@ def build_app(cfg: dict, allowlist: dict[str, str], with_auth: bool = True) -> F
         ][:limit]
         return json.dumps(matches, indent=2)
 
+    def readiness_checks() -> dict[str, bool]:
+        return {
+            "sample_data": isinstance(data.get("services"), list)
+            and isinstance(data.get("runbooks"), list),
+            "state_dir_writable": _state_dir_writable(state_dir),
+            "signing_key": signing_key_present,
+            "auth_configured": auth is not None,
+            "fault_injected": fault_injected,
+        }
+
+    @mcp.custom_route("/healthz", methods=["GET"], include_in_schema=False)
+    async def healthz(request: Request) -> JSONResponse:
+        return JSONResponse({"status": "ok"}, headers=NO_STORE_HEADERS)
+
+    @mcp.custom_route("/readyz", methods=["GET"], include_in_schema=False)
+    async def readyz(request: Request) -> JSONResponse:
+        checks = readiness_checks()
+        ready = (
+            checks["sample_data"]
+            and checks["state_dir_writable"]
+            and checks["signing_key"]
+            and checks["auth_configured"]
+            and not checks["fault_injected"]
+        )
+        body = {"status": "ready" if ready else "not_ready", "checks": checks}
+        return JSONResponse(
+            body, status_code=200 if ready else 503, headers=NO_STORE_HEADERS
+        )
+
+    mcp.readiness_checks = readiness_checks
+
     return mcp
 
 
-def _build_auth(cfg: dict, allowlist: dict[str, str]) -> AllowlistedGitHubProvider:
+def create_http_app(mcp: FastMCP):
+    """Return the mounted Starlette ASGI app so tests can drive it with
+    starlette.testclient.TestClient."""
+    return mcp.http_app()
+
+
+def _resolve_signing_key(key_file: Path, explicit_key: str) -> str:
+    """Generate-once contract (CONTRACTS.md section 1). An explicit,
+    non-placeholder key of sufficient length is used verbatim and no file is
+    written. Otherwise: reuse an existing non-empty key file, or generate one
+    and persist it atomically with mode 0600; never rotate on restart."""
+    if explicit_key != PLACEHOLDER:
+        if len(explicit_key) < MIN_SIGNING_KEY_LENGTH:
+            raise ConfigError(
+                f"GATEWAY_JWT_SIGNING_KEY must be at least {MIN_SIGNING_KEY_LENGTH} characters"
+            )
+        return explicit_key
+
+    key_file.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(key_file.parent, 0o700)
+    except OSError:
+        pass
+
+    existing = ""
+    if key_file.is_file():
+        existing = key_file.read_text(encoding="utf-8").strip()
+    if existing:
+        return existing
+
+    generated = secrets.token_hex(32)
+    tmp_path = key_file.with_name(f"{key_file.name}.tmp-{os.getpid()}-{secrets.token_hex(4)}")
+    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(generated)
+        os.replace(tmp_path, key_file)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+    os.chmod(key_file, 0o600)
+    return generated
+
+
+def _build_auth(cfg: dict, allowlist: dict[str, str]) -> tuple[AllowlistedGitHubProvider, bool]:
     if credentials_are_placeholders(cfg):
-        raise ConfigError("OAuth credentials or signing key are placeholders")
+        raise ConfigError("OAuth client id or secret are placeholders")
 
     from key_value.aio.stores.disk import DiskStore
 
     storage = Path(cfg["client_storage"])
-    storage.mkdir(parents=True, exist_ok=True)
+    _ensure_dir_0700(storage)
     client_store = DiskStore(directory=str(storage))
 
-    signing_key = cfg["jwt_signing_key"]
-    if signing_key == PLACEHOLDER:
-        key_path = storage / "jwt_signing_key"
-        if key_path.is_file():
-            signing_key = key_path.read_text(encoding="utf-8").strip()
-        if not signing_key:
-            signing_key = secrets.token_hex(32)
-            fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(signing_key)
+    signing_key = _resolve_signing_key(Path(cfg["jwt_signing_key_file"]), cfg["jwt_signing_key"])
 
-    return AllowlistedGitHubProvider(
+    provider = AllowlistedGitHubProvider(
         allowlist=allowlist,
         **{
             "client_id": cfg["github_client_id"],
@@ -204,6 +310,7 @@ def _build_auth(cfg: dict, allowlist: dict[str, str]) -> AllowlistedGitHubProvid
             "timeout_seconds": 10,
         },
     )
+    return provider, bool(signing_key)
 
 
 def main() -> None:
