@@ -16,3 +16,15 @@ certs/
 # Runtime logs
 logs/
 *.log
+
+# Worktrees and private evidence
+.claude/
+evidence/raw/
+
+# Terraform working directories, state, and operator-supplied inputs
+infra/**/.terraform/
+*.tfstate
+*.tfstate.*
+backend.hcl
+*.tfvars
+!*.tfvars.example

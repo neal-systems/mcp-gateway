@@ -1,3 +1,5 @@
 fastmcp==3.4.2
 py-key-value-aio[disk]==0.4.5
 pytest==9.1.1
+opentelemetry-sdk==1.44.0
+opentelemetry-exporter-otlp-proto-http==1.44.0

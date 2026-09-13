@@ -1,0 +1,25 @@
+#cloud-config
+# Rendered by infra/aws/demo/instance.tf. The two scripts are the working-tree
+# copies of scripts/cloud/instance/, gzipped and base64'd so the whole document
+# stays inside the 16 KiB EC2 user-data limit.
+write_files:
+  - path: /opt/mcp-gateway/bin/bootstrap.sh
+    owner: root:root
+    permissions: '0755'
+    encoding: gz+b64
+    content: ${bootstrap_sh}
+  - path: /opt/mcp-gateway/bin/gateway-release
+    owner: root:root
+    permissions: '0755'
+    encoding: gz+b64
+    content: ${gateway_release}
+  - path: /etc/mcp-gateway/instance.env
+    owner: root:root
+    permissions: '0644'
+    content: |
+      AWS_DEFAULT_REGION=${region}
+      AWS_REGION=${region}
+      GATEWAY_SSM_PREFIX=${ssm_prefix}
+
+runcmd:
+  - [/bin/bash, /opt/mcp-gateway/bin/bootstrap.sh]

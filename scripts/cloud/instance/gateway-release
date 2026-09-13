@@ -1,0 +1,684 @@
+#!/usr/bin/env bash
+# gateway-release - instance entrypoint for the mcp-gateway demo release flow.
+# Implements docs/cloud/CONTRACTS.md section 5.
+#
+# Exit codes: 0 ok, 2 usage/validation, 3 release failed and rolled back,
+#             4 lock held, 5 prerequisite missing.
+#
+# Every path is overridable by environment so the script can be exercised
+# locally without AWS (see tests/cloud/local_release_drill.sh).
+set -euo pipefail
+
+# Non-secret instance defaults (region, SSM prefix) written by cloud-init.
+# SSM RunShellScript gives us no login shell, so this is how the instance tells
+# the script where it lives. Anything already exported by the caller wins, which
+# is what lets the local drill override every path.
+INSTANCE_ENV="${GATEWAY_INSTANCE_ENV:-/etc/mcp-gateway/instance.env}"
+if [ -f "$INSTANCE_ENV" ]; then
+  while IFS='=' read -r _k _v; do
+    case "$_k" in '' | \#*) continue ;; esac
+    [ -n "${!_k-}" ] || export "$_k=$_v"
+  done <"$INSTANCE_ENV"
+  unset _k _v
+fi
+
+ROOT="${GATEWAY_RELEASE_ROOT:-/opt/mcp-gateway}"
+CONFIG_FILE="${GATEWAY_CONFIG_FILE:-/etc/mcp-gateway/config.env}"
+STATE_ROOT="${GATEWAY_STATE_ROOT:-/srv/mcp-gateway}"
+SSM_PREFIX="${GATEWAY_SSM_PREFIX:-/mcp-gateway/demo/}"
+CONFIG_SOURCE="${GATEWAY_CONFIG_SOURCE:-ssm}"
+INTERNAL_PORT="${GATEWAY_INTERNAL_PORT:-8080}"
+PROJECT="${GATEWAY_COMPOSE_PROJECT:-mcpgw}"
+CADDYFILE="${GATEWAY_CADDYFILE:-/etc/mcp-gateway/Caddyfile}"
+READY_TIMEOUT="${GATEWAY_READY_TIMEOUT:-60}"
+# Local exercise only. On the instance this is always /readyz, which is the
+# endpoint the contract defines; the drill points it at a path the current app
+# actually serves so the deploy/rollback state machine can be tested before
+# /readyz exists.
+READY_PATH="${GATEWAY_READY_PATH:-/readyz}"
+
+# Caddy is pinned by multi-arch index digest so the front door never moves
+# underneath a release. Refresh with:
+#   docker buildx imagetools inspect caddy:2.10-alpine
+# and copy the "Digest:" line. Recorded 2026-09-13 for caddy:2.10-alpine.
+CADDY_IMAGE="${GATEWAY_CADDY_IMAGE:-caddy@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d}"
+
+APP_CONTAINER="${PROJECT}-mcp-app-1"
+RELEASES_LOG="$ROOT/releases.log"
+KNOWN_GOOD="$ROOT/known-good.json"
+CURRENT="$ROOT/current"
+
+log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >&2; }
+die() { log "ERROR: $2"; exit "$1"; }
+
+need() { command -v "$1" >/dev/null 2>&1 || die 5 "missing prerequisite: $1"; }
+
+now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+now_s() { date +%s.%N; }
+
+SECONDS_TO_READY=""
+INTERRUPTION_SECONDS=""
+
+# ---------------------------------------------------------------- utilities
+
+# Read one key out of the rendered runtime env file without sourcing it.
+config_value() {
+  local key="$1"
+  [ -f "$CONFIG_FILE" ] || return 0
+  sed -n "s/^${key}=//p" "$CONFIG_FILE" | tail -n 1
+}
+
+# ------------------------------------------------------------- manifest I/O
+
+# Decode and validate a base64 manifest. Echoes "release_id<TAB>image" and
+# leaves the decoded document at $ROOT/.manifest.tmp.
+validate_manifest() {
+  local b64="$1" json parsed rid image
+  json="$(printf '%s' "$b64" | base64 -d 2>/dev/null)" ||
+    die 2 "manifest is not valid base64"
+
+  parsed="$(printf '%s' "$json" | python3 -c '
+import json, sys
+try:
+    m = json.load(sys.stdin)
+except Exception as exc:
+    sys.stderr.write("manifest is not valid JSON: %s\n" % exc)
+    sys.exit(1)
+if not isinstance(m, dict):
+    sys.stderr.write("manifest must be a JSON object\n")
+    sys.exit(1)
+if m.get("schema") != 1:
+    sys.stderr.write("manifest schema must be 1\n")
+    sys.exit(1)
+for key in ("release_id", "image"):
+    if not isinstance(m.get(key), str) or not m[key]:
+        sys.stderr.write("manifest missing string field: %s\n" % key)
+        sys.exit(1)
+print("%s\t%s" % (m["release_id"], m["image"]))
+')" || die 2 "manifest validation failed"
+
+  rid="${parsed%%$'\t'*}"
+  image="${parsed#*$'\t'}"
+
+  [[ "$rid" =~ ^[A-Za-z0-9._-]{1,64}$ ]] ||
+    die 2 "release_id does not match ^[A-Za-z0-9._-]{1,64}\$"
+
+  if [[ "$image" =~ ^ghcr\.io/neal-systems/mcp-gateway@sha256:[0-9a-f]{64}$ ]]; then
+    :
+  elif [ "${GATEWAY_IMAGE_ALLOW_LOCAL:-0}" = "1" ] &&
+    [[ "$image" =~ ^[A-Za-z0-9._:/-]*mcp-gateway-local@sha256:[0-9a-f]{64}$ ]]; then
+    log "accepting local image reference (GATEWAY_IMAGE_ALLOW_LOCAL=1)"
+  else
+    die 2 "image must be a ghcr.io/neal-systems/mcp-gateway digest reference"
+  fi
+
+  printf '%s' "$json" >"$ROOT/.manifest.tmp"
+  printf '%s\t%s\n' "$rid" "$image"
+}
+
+# ------------------------------------------------------------ config render
+
+# Renders the runtime env file for the app container. Values come from SSM
+# SecureString parameters; the fixed lines below are non-secret by design.
+render_config() {
+  local release_id="$1"
+  if [ "$CONFIG_SOURCE" = "file" ]; then
+    [ -f "$CONFIG_FILE" ] ||
+      die 5 "GATEWAY_CONFIG_SOURCE=file but $CONFIG_FILE is absent"
+    log "using the existing runtime env file (GATEWAY_CONFIG_SOURCE=file)"
+    local tmp
+    tmp="$(mktemp)"
+    chmod 0600 "$tmp"
+    grep -v '^GATEWAY_RELEASE_ID=' "$CONFIG_FILE" >"$tmp" || true
+    printf 'GATEWAY_RELEASE_ID=%s\n' "$release_id" >>"$tmp"
+    install -m 0600 "$tmp" "$CONFIG_FILE"
+    rm -f "$tmp"
+    return 0
+  fi
+
+  local rendered tmp domain
+  if [ -n "${GATEWAY_SSM_FAKE_JSON:-}" ]; then
+    # Test hook: a file shaped like the get-parameters-by-path response, so the
+    # SSM-mode render can be exercised without AWS. Never set on the instance.
+    rendered="$(cat "$GATEWAY_SSM_FAKE_JSON")"
+  else
+    need aws
+    rendered="$(aws ssm get-parameters-by-path --path "$SSM_PREFIX" --recursive \
+      --with-decryption --output json)" ||
+      die 5 "cannot read SSM parameters under $SSM_PREFIX"
+  fi
+
+  tmp="$(mktemp)"
+  chmod 0600 "$tmp"
+  # Parameter names are mapped explicitly to the names the application reads
+  # (CONTRACTS.md sections 1 and 6). An unknown parameter is ignored with a
+  # warning rather than smuggled into the environment.
+  printf '%s' "$rendered" | python3 -c '
+import json, sys
+MAP = {
+    "gateway_domain": "GATEWAY_DOMAIN",
+    "github_client_id": "GITHUB_CLIENT_ID",
+    "github_client_secret": "GITHUB_CLIENT_SECRET",
+    "operator_github_ids": "GATEWAY_OPERATOR_GITHUB_IDS",
+    "viewer_github_ids": "GATEWAY_VIEWER_GITHUB_IDS",
+}
+doc = json.load(sys.stdin)
+for p in doc.get("Parameters", []):
+    short = p["Name"].rstrip("/").rsplit("/", 1)[-1]
+    value = p.get("Value", "")
+    if short not in MAP:
+        sys.stderr.write("ignoring unknown parameter %s\n" % short)
+        continue
+    if "\n" in value or "\r" in value:
+        sys.stderr.write("parameter %s contains a newline; refusing\n" % short)
+        sys.exit(1)
+    print("%s=%s" % (MAP[short], value))
+' >>"$tmp" || {
+    rm -f "$tmp"
+    die 5 "failed to render parameters from $SSM_PREFIX"
+  }
+
+  domain="$(sed -n 's/^GATEWAY_DOMAIN=//p' "$tmp" | tail -n 1)"
+  if [ -z "$domain" ]; then
+    rm -f "$tmp"
+    die 5 "${SSM_PREFIX}gateway_domain is not set"
+  fi
+
+  # Fixed, non-secret lines. None of these is ever sourced from SSM.
+  cat >>"$tmp" <<EOF
+GATEWAY_STATE_DIR=/data/state
+GATEWAY_BASE_URL=https://${domain}
+GATEWAY_HOST=0.0.0.0
+GATEWAY_PORT=8080
+GATEWAY_RELEASE_ID=${release_id}
+GATEWAY_LOG_FORMAT=json
+GATEWAY_LOG_LEVEL=INFO
+GATEWAY_OTEL_EXPORTER=stdout
+GATEWAY_TRACE_SAMPLE_RATIO=1.0
+GATEWAY_METRICS_INTERVAL_SECONDS=60
+EOF
+
+  install -m 0600 "$tmp" "$CONFIG_FILE"
+  rm -f "$tmp"
+  log "rendered the runtime env file from $SSM_PREFIX"
+}
+
+# ----------------------------------------------------------- compose render
+
+render_compose() {
+  local dir="$1" image="$2" release_id="$3" domain
+  domain="$(config_value GATEWAY_DOMAIN)"
+  [ -n "$domain" ] || domain="localhost"
+
+  {
+    cat <<EOF
+name: ${PROJECT}
+services:
+  mcp-app:
+    image: ${image}
+    env_file:
+      - ${CONFIG_FILE}
+    environment:
+      GATEWAY_RELEASE_ID: "${release_id}"
+    volumes:
+      - ${STATE_ROOT}/state:/data/state
+    ports:
+      - "127.0.0.1:${INTERNAL_PORT}:8080"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+EOF
+    if [ "${GATEWAY_LOCAL_NO_CADDY:-0}" != "1" ]; then
+      cat <<EOF
+
+  caddy:
+    image: ${CADDY_IMAGE}
+    environment:
+      GATEWAY_DOMAIN: "${domain}"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ${CADDYFILE}:/etc/caddy/Caddyfile:ro
+      - ${STATE_ROOT}/caddy/data:/data
+      - ${STATE_ROOT}/caddy/config:/config
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    depends_on:
+      - mcp-app
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+EOF
+    fi
+  } >"$dir/compose.yml"
+}
+
+# The fault switch lives in a compose override so it can never be written into
+# the runtime env file, which is rendered from SSM and outlives the drill.
+render_drill_override() {
+  cat >"$1/override.yml" <<'EOF'
+services:
+  mcp-app:
+    environment:
+      GATEWAY_FAULT_INJECT: "not_ready"
+EOF
+}
+
+compose_up() {
+  local dir="$1"
+  local args=(-f "$dir/compose.yml")
+  [ -f "$dir/override.yml" ] && args+=(-f "$dir/override.yml")
+  docker compose -p "$PROJECT" "${args[@]}" up -d --remove-orphans >&2
+}
+
+# --------------------------------------------------------------- readiness
+
+# Readiness means "the candidate container is up AND answering", never just
+# "something answers on the port". Without the container check a release can be
+# declared ready by a listener that outlives the container it belongs to -- the
+# published port is torn down asynchronously when a container dies, so during a
+# swap the probe can be answered by the release we are replacing.
+app_running() {
+  [ "$(docker inspect -f '{{.State.Running}}' "$APP_CONTAINER" 2>/dev/null)" = "true" ]
+}
+
+probe_ready() {
+  app_running || return 1
+  curl -fsS -m 3 -o /dev/null "http://127.0.0.1:${INTERNAL_PORT}${READY_PATH}" 2>/dev/null
+}
+
+wait_ready() {
+  local deadline=$(($(date +%s) + READY_TIMEOUT))
+  while [ "$(date +%s)" -le "$deadline" ]; do
+    if probe_ready; then return 0; fi
+    sleep 1
+  done
+  return 1
+}
+
+# ------------------------------------------------------------------ logging
+
+log_record() {
+  # log_record <action> <release_id> <image> <outcome> <secs_ready> <interrupt>
+  python3 -c '
+import json, sys
+at, action, rid, image, outcome, sec, inter = sys.argv[1:8]
+rec = {"at": at, "action": action, "release_id": rid, "image": image,
+       "outcome": outcome}
+rec["seconds_to_ready"] = None if sec == "" else round(float(sec), 3)
+rec["interruption_seconds"] = None if inter == "" else round(float(inter), 3)
+print(json.dumps(rec, sort_keys=True))
+' "$(now_iso)" "$@" >>"$RELEASES_LOG"
+}
+
+# ------------------------------------------------------------------ actions
+
+current_release_id() {
+  [ -L "$CURRENT" ] || return 0
+  basename "$(readlink -f "$CURRENT")"
+}
+
+current_image() {
+  local dir
+  dir="$(readlink -f "$CURRENT" 2>/dev/null)" || return 0
+  [ -n "$dir" ] && [ -f "$dir/manifest.json" ] || return 0
+  python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("image",""))' \
+    "$dir/manifest.json"
+}
+
+manifest_field() {
+  python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2],""))' \
+    "$1" "$2"
+}
+
+# Echoes the epoch at which the running app container stopped, or "" when
+# nothing was running. That epoch anchors interruption_seconds.
+stop_app_if_running() {
+  if docker ps --format '{{.Names}}' | grep -qx "$APP_CONTAINER"; then
+    docker stop -t 20 "$APP_CONTAINER" >/dev/null 2>&1 || true
+    now_s
+  else
+    printf ''
+  fi
+}
+
+# bring_up <release-dir> <release_id> <stop_epoch or "">
+bring_up() {
+  local dir="$1" stop_at="$3" start ready_at
+  start="$(now_s)"
+  compose_up "$dir"
+  if wait_ready; then
+    ready_at="$(now_s)"
+    SECONDS_TO_READY="$(python3 -c 'import sys;print(float(sys.argv[1])-float(sys.argv[2]))' "$ready_at" "$start")"
+    if [ -n "$stop_at" ]; then
+      INTERRUPTION_SECONDS="$(python3 -c 'import sys;print(float(sys.argv[1])-float(sys.argv[2]))' "$ready_at" "$stop_at")"
+    else
+      INTERRUPTION_SECONDS="0"
+    fi
+    return 0
+  fi
+  SECONDS_TO_READY=""
+  INTERRUPTION_SECONDS=""
+  return 1
+}
+
+deploy_dir_for() {
+  local dir="$ROOT/releases/$1"
+  mkdir -p "$dir"
+  printf '%s' "$dir"
+}
+
+do_deploy() {
+  local manifest_b64="" drill=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+    --manifest-b64)
+      manifest_b64="${2:-}"
+      shift 2
+      ;;
+    --drill-not-ready)
+      drill=1
+      shift
+      ;;
+    *) die 2 "unknown argument: $1" ;;
+    esac
+  done
+  [ -n "$manifest_b64" ] || die 2 "deploy requires --manifest-b64"
+
+  need docker
+  need python3
+  need curl
+
+  local parsed rid image dir stop_at
+  parsed="$(validate_manifest "$manifest_b64")"
+  rid="${parsed%%$'\t'*}"
+  image="${parsed#*$'\t'}"
+
+  # A drill candidate gets its own release id so it can never overwrite the
+  # release directory of the known-good release it is meant to fall back to.
+  if [ "$drill" = "1" ]; then
+    rid="${rid}-drill"
+  fi
+
+  # Refuse to overwrite the known-good release's directory with different
+  # content: a failed candidate under the same id would leave nothing to
+  # roll back to. An identical redeploy (same id, same digest) is allowed.
+  if [ -f "$KNOWN_GOOD" ] && [ "$(manifest_field "$KNOWN_GOOD" release_id)" = "$rid" ] \
+    && [ "$(manifest_field "$KNOWN_GOOD" image)" != "$image" ]; then
+    rm -f "$ROOT/.manifest.tmp"
+    die 2 "release_id $rid is the known-good release with a different image; use a new release_id"
+  fi
+
+  render_config "$rid"
+
+  dir="$(deploy_dir_for "$rid")"
+  mv "$ROOT/.manifest.tmp" "$dir/manifest.json"
+  render_compose "$dir" "$image" "$rid"
+  rm -f "$dir/override.yml"
+  [ "$drill" = "1" ] && render_drill_override "$dir"
+
+  log "pulling $image"
+  docker pull "$image" >&2 || die 5 "docker pull failed for $image"
+
+  stop_at="$(stop_app_if_running)"
+
+  if bring_up "$dir" "$rid" "$stop_at"; then
+    ln -sfn "$dir" "$CURRENT"
+    cp "$dir/manifest.json" "$KNOWN_GOOD"
+    log_record deploy "$rid" "$image" ready "$SECONDS_TO_READY" "$INTERRUPTION_SECONDS"
+    do_status
+    return 0
+  fi
+
+  log "release $rid did not become ready within ${READY_TIMEOUT}s"
+  log_record deploy "$rid" "$image" not_ready "" ""
+
+  if [ -f "$KNOWN_GOOD" ]; then
+    local kg_rid kg_image kg_dir rb_stop
+    kg_rid="$(manifest_field "$KNOWN_GOOD" release_id)"
+    kg_image="$(manifest_field "$KNOWN_GOOD" image)"
+    if [ "$kg_rid" = "$rid" ]; then
+      log "known-good is the failed release; there is nothing to roll back to"
+      do_status
+      exit 3
+    fi
+    log "rolling back to known-good release $kg_rid"
+    kg_dir="$(deploy_dir_for "$kg_rid")"
+    cp "$KNOWN_GOOD" "$kg_dir/manifest.json"
+    render_config "$kg_rid"
+    render_compose "$kg_dir" "$kg_image" "$kg_rid"
+    rm -f "$kg_dir/override.yml"
+    rb_stop="$(stop_app_if_running)"
+    if bring_up "$kg_dir" "$kg_rid" "$rb_stop"; then
+      ln -sfn "$kg_dir" "$CURRENT"
+      log_record rollback "$kg_rid" "$kg_image" ready "$SECONDS_TO_READY" "$INTERRUPTION_SECONDS"
+    else
+      log_record rollback "$kg_rid" "$kg_image" not_ready "" ""
+      log "rollback to $kg_rid also failed"
+    fi
+  else
+    log "no known-good release recorded; leaving the failed release in place"
+  fi
+
+  do_status
+  exit 3
+}
+
+do_rollback() {
+  need docker
+  need python3
+  need curl
+  [ -f "$KNOWN_GOOD" ] || die 3 "no known-good release recorded"
+  local rid image dir stop_at
+  rid="$(manifest_field "$KNOWN_GOOD" release_id)"
+  image="$(manifest_field "$KNOWN_GOOD" image)"
+  dir="$(deploy_dir_for "$rid")"
+  cp "$KNOWN_GOOD" "$dir/manifest.json"
+  render_config "$rid"
+  render_compose "$dir" "$image" "$rid"
+  rm -f "$dir/override.yml"
+  docker pull "$image" >&2 || die 5 "docker pull failed for $image"
+  stop_at="$(stop_app_if_running)"
+  if bring_up "$dir" "$rid" "$stop_at"; then
+    ln -sfn "$dir" "$CURRENT"
+    log_record rollback "$rid" "$image" ready "$SECONDS_TO_READY" "$INTERRUPTION_SECONDS"
+    do_status
+    return 0
+  fi
+  log_record rollback "$rid" "$image" not_ready "" ""
+  do_status
+  exit 3
+}
+
+# resume brings `current` back up after a reboot without changing the release.
+do_resume() {
+  need docker
+  need python3
+  need curl
+  if [ ! -L "$CURRENT" ]; then
+    log "no current release; nothing to resume"
+    printf '{"action":"resume","outcome":"no_current"}\n'
+    return 0
+  fi
+  local dir rid image
+  dir="$(readlink -f "$CURRENT")"
+  rid="$(basename "$dir")"
+  image="$(current_image)"
+  if bring_up "$dir" "$rid" ""; then
+    log_record resume "$rid" "$image" ready "$SECONDS_TO_READY" "0"
+    do_status
+    return 0
+  fi
+  log_record resume "$rid" "$image" not_ready "" ""
+  do_status
+  exit 3
+}
+
+do_status() {
+  local rid image ready kg_rid kg_image
+  rid="$(current_release_id)"
+  image="$(current_image)"
+  if probe_ready; then ready=true; else ready=false; fi
+  kg_rid=""
+  kg_image=""
+  if [ -f "$KNOWN_GOOD" ]; then
+    kg_rid="$(manifest_field "$KNOWN_GOOD" release_id)"
+    kg_image="$(manifest_field "$KNOWN_GOOD" image)"
+  fi
+  python3 -c '
+import json, sys
+rid, image, ready, kg_rid, kg_image = sys.argv[1:6]
+print(json.dumps({
+    "release_id": rid or None,
+    "image": image or None,
+    "ready": ready == "true",
+    "known_good_release_id": kg_rid or None,
+    "known_good_image": kg_image or None,
+}, sort_keys=True))
+' "$rid" "$image" "$ready" "$kg_rid" "$kg_image"
+}
+
+http_code() {
+  local method="$1" path="$2" body="${3:-}"
+  if [ -n "$body" ]; then
+    curl -s -o /dev/null -m 5 -w '%{http_code}' -X "$method" \
+      -H 'Content-Type: application/json' --data "$body" \
+      "http://127.0.0.1:${INTERNAL_PORT}${path}" 2>/dev/null || printf '000'
+  else
+    curl -s -o /dev/null -m 5 -w '%{http_code}' -X "$method" \
+      "http://127.0.0.1:${INTERNAL_PORT}${path}" 2>/dev/null || printf '000'
+  fi
+}
+
+do_smoke() {
+  need curl
+  need python3
+  local healthz readyz mcp
+  healthz="$(http_code GET /healthz)"
+  readyz="$(http_code GET /readyz)"
+  mcp="$(http_code POST /mcp '{"jsonrpc":"2.0","id":1,"method":"tools/list"}')"
+  python3 -c '
+import json, sys
+healthz, readyz, mcp = sys.argv[1:4]
+checks = {
+    "healthz_200": healthz == "200",
+    "readyz_200": readyz == "200",
+    "mcp_unauthenticated_401": mcp == "401",
+}
+out = {"checks": checks,
+       "observed": {"healthz": healthz, "readyz": readyz, "mcp": mcp},
+       "result": "pass" if all(checks.values()) else "fail"}
+print(json.dumps(out, sort_keys=True))
+sys.exit(0 if out["result"] == "pass" else 1)
+' "$healthz" "$readyz" "$mcp"
+}
+
+do_evidence() {
+  need python3
+  local status_json log_lines app_logs
+  status_json="$(do_status)"
+  log_lines=""
+  [ -f "$RELEASES_LOG" ] && log_lines="$(tail -n 20 "$RELEASES_LOG")"
+  app_logs="$(docker logs --tail 200 "$APP_CONTAINER" 2>&1 || true)"
+
+  python3 -c '
+import json, re, sys
+status = json.loads(sys.argv[1])
+raw_log = sys.argv[2]
+raw_app = sys.argv[3]
+
+releases = []
+for line in raw_log.splitlines():
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        releases.append(json.loads(line))
+    except ValueError:
+        releases.append({"unparsed": line[:200]})
+
+# The app redacts at source. This is a second, independent pass so anything a
+# future code path leaks still never reaches an evidence bundle.
+KEYS = ("authorization|cookie|set-cookie|code|token|access_token|refresh_token|"
+        "id_token|client_secret|client_id|signing_key|jwt_signing_key|password|"
+        "secret|api_key")
+PATTERNS = [
+    (re.compile(r"(\"?(?:" + KEYS + r")\"?\s*[:=]\s*\"?)([^\"&\s,;]+)", re.I), r"\1<redacted>"),
+    (re.compile(r"gh[pousr]_[A-Za-z0-9]{8,}"), "<redacted-github-token>"),
+    (re.compile(r"github_pat_[A-Za-z0-9_]{8,}"), "<redacted-github-token>"),
+    (re.compile(r"(?i)bearer\s+[A-Za-z0-9._~+/-]{8,}=*"), "Bearer <redacted>"),
+    (re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}"), "<redacted-jwt>"),
+    (re.compile(r"\b[0-9a-fA-F]{64}\b"), "<redacted-64hex>"),
+]
+
+
+def scrub(text):
+    for pattern, replacement in PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+lines = [scrub(line) for line in raw_app.splitlines()][-200:]
+print(json.dumps({"status": status, "releases": releases, "app_logs": lines},
+                 sort_keys=True))
+' "$status_json" "$log_lines" "$app_logs"
+}
+
+# --------------------------------------------------------------------- main
+
+usage() {
+  cat >&2 <<'EOF'
+usage: gateway-release <subcommand>
+  deploy --manifest-b64 <base64 manifest.json> [--drill-not-ready]
+  rollback
+  resume
+  status
+  smoke
+  evidence
+EOF
+  exit 2
+}
+
+main() {
+  [ $# -ge 1 ] || usage
+  local sub="$1"
+  shift
+
+  mkdir -p "$ROOT/bin" "$ROOT/releases"
+  touch "$RELEASES_LOG"
+
+  case "$sub" in
+  deploy | rollback | resume)
+    exec 9>"$ROOT/lock"
+    flock -n 9 || die 4 "another gateway-release holds $ROOT/lock"
+    case "$sub" in
+    deploy) do_deploy "$@" ;;
+    rollback) do_rollback ;;
+    resume) do_resume ;;
+    esac
+    ;;
+  status) do_status ;;
+  smoke) do_smoke ;;
+  evidence) do_evidence ;;
+  -h | --help | help) usage ;;
+  *) die 2 "unknown subcommand: $sub" ;;
+  esac
+}
+
+main "$@"

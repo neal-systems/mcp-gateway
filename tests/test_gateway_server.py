@@ -20,12 +20,17 @@ ALLOWLIST = {
 
 
 def config(tmp_path: Path) -> dict:
+    state_dir = tmp_path / "state"
     return {
         "base_url": "https://gateway.example.com",
         "github_client_id": "obviously-fake-client-id",
         "github_client_secret": "obviously-fake-client-secret",
-        "jwt_signing_key": "test-signing-value-not-for-use",
+        "jwt_signing_key": "test-signing-value-not-for-use-but-32-chars",
+        "state_dir": str(state_dir),
         "client_storage": str(tmp_path / "oauth"),
+        "jwt_signing_key_file": str(state_dir / "jwt_signing_key"),
+        "release_id": "dev",
+        "fault_inject": None,
         "host": "127.0.0.1",
         "port": 8080,
         "sample_data": Path(__file__).parents[1] / "app" / "sample_data.json",
@@ -180,3 +185,139 @@ def test_example_tools_read_shipped_data(monkeypatch, tmp_path):
     assert len(json.loads(listed)) == 1
     assert json.loads(details)["status"] == "degraded"
     assert json.loads(searched)[0]["title"] == "Investigating elevated latency"
+
+
+def test_load_config_derives_state_paths_from_state_dir(monkeypatch, tmp_path):
+    state_dir = tmp_path / "custom-state"
+    monkeypatch.setenv("GATEWAY_STATE_DIR", str(state_dir))
+    monkeypatch.delenv("GATEWAY_CLIENT_STORAGE", raising=False)
+    monkeypatch.delenv("GATEWAY_JWT_SIGNING_KEY_FILE", raising=False)
+    monkeypatch.delenv("GATEWAY_RELEASE_ID", raising=False)
+    monkeypatch.delenv("GATEWAY_FAULT_INJECT", raising=False)
+
+    cfg = server.load_config()
+
+    assert cfg["state_dir"] == str(state_dir)
+    assert cfg["client_storage"] == str(state_dir / "client_storage")
+    assert cfg["jwt_signing_key_file"] == str(state_dir / "jwt_signing_key")
+    assert cfg["release_id"] == "dev"
+    assert cfg["fault_inject"] is None
+
+
+def test_load_config_respects_explicit_client_storage_override(monkeypatch, tmp_path):
+    state_dir = tmp_path / "state"
+    explicit_storage = tmp_path / "elsewhere"
+    monkeypatch.setenv("GATEWAY_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("GATEWAY_CLIENT_STORAGE", str(explicit_storage))
+
+    cfg = server.load_config()
+
+    assert cfg["client_storage"] == str(explicit_storage)
+
+
+def test_load_config_defaults_match_container_contract(monkeypatch):
+    for name in (
+        "GATEWAY_STATE_DIR",
+        "GATEWAY_CLIENT_STORAGE",
+        "GATEWAY_JWT_SIGNING_KEY_FILE",
+        "GATEWAY_RELEASE_ID",
+        "GATEWAY_FAULT_INJECT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    cfg = server.load_config()
+
+    assert cfg["state_dir"] == "/data/state"
+    assert cfg["client_storage"] == "/data/state/client_storage"
+    assert cfg["jwt_signing_key_file"] == "/data/state/jwt_signing_key"
+    assert cfg["release_id"] == "dev"
+    assert cfg["fault_inject"] is None
+
+
+def test_telemetry_wraps_requests_and_denied_tool_calls(monkeypatch, tmp_path):
+    """A denied direct call must appear as a 'denied' tool span, and every HTTP
+    response must carry the correlation id, when telemetry is wired in."""
+    import telemetry as telemetry_module
+    from starlette.testclient import TestClient
+
+    tel = telemetry_module.configure_telemetry(exporter="memory", release_id="test-rel")
+    monkeypatch.setattr(server, "_current_role", lambda _allowlist: scope.ROLE_VIEWER)
+    app = server.build_app(config(tmp_path), ALLOWLIST, with_auth=False, telemetry=tel)
+
+    with TestClient(server.create_http_app(app, tel)) as client:
+        response = client.get("/healthz", headers={"X-Request-ID": "req-abc-123"})
+    assert response.status_code == 200
+    assert response.headers["X-Request-ID"] == "req-abc-123"
+
+    context = types.SimpleNamespace(message=types.SimpleNamespace(name="search_runbooks"))
+
+    async def call_next(_context):
+        return "unexpected"
+
+    # FastMCP prepends its own built-in middleware; ours must be in order:
+    # tool span outermost, then the authorization check.
+    chain = [
+        item for item in app.middleware
+        if isinstance(item, (telemetry_module.ToolSpanMiddleware, server.ScopeMiddleware))
+    ]
+    assert isinstance(chain[0], telemetry_module.ToolSpanMiddleware)
+    assert isinstance(chain[1], server.ScopeMiddleware)
+
+    async def run_chain():
+        async def inner(ctx):
+            return await chain[1].on_call_tool(ctx, call_next)
+        return await chain[0].on_call_tool(context, inner)
+
+    with pytest.raises(server.ToolError):
+        asyncio.run(run_chain())
+
+    spans = {span.name: span for span in tel.span_exporter.get_finished_spans()}
+    assert spans["mcp.tool"].attributes["gateway.outcome"] == "denied"
+    assert spans["mcp.tool"].attributes["mcp.tool.name"] == "search_runbooks"
+    assert "http.request" in spans
+    assert app.readiness_checks()["auth_configured"] is False
+
+
+def _ready_gauge_value(tel) -> int | None:
+    for rm in tel.metric_reader.get_metrics_data().resource_metrics:
+        for sm in rm.scope_metrics:
+            for metric in sm.metrics:
+                if metric.name != "gateway.ready":
+                    continue
+                for point in metric.data.data_points:
+                    return point.value
+    return None
+
+
+def test_ready_gauge_matches_readyz_when_fully_configured(tmp_path):
+    """The gateway.ready gauge must agree with /readyz: both apply the same
+    readiness contract (first four checks true and no fault injected), not
+    the weaker all(checks.values()) over all five, which also folds in
+    fault_injected as if it needed to be True."""
+    import telemetry as telemetry_module
+    from starlette.testclient import TestClient
+
+    tel = telemetry_module.configure_telemetry(exporter="memory")
+    app = server.build_app(config(tmp_path), ALLOWLIST, with_auth=True, telemetry=tel)
+
+    assert _ready_gauge_value(tel) == 1
+    with TestClient(server.create_http_app(app, tel)) as client:
+        response = client.get("/readyz")
+    assert response.status_code == 200
+    assert response.json()["status"] == "ready"
+
+
+def test_ready_gauge_matches_readyz_on_fault_injection(tmp_path):
+    import telemetry as telemetry_module
+    from starlette.testclient import TestClient
+
+    cfg = config(tmp_path)
+    cfg["fault_inject"] = "not_ready"
+    tel = telemetry_module.configure_telemetry(exporter="memory")
+    app = server.build_app(cfg, ALLOWLIST, with_auth=True, telemetry=tel)
+
+    assert _ready_gauge_value(tel) == 0
+    with TestClient(server.create_http_app(app, tel)) as client:
+        response = client.get("/readyz")
+    assert response.status_code == 503
+    assert response.json()["status"] == "not_ready"
