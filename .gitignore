@@ -16,3 +16,7 @@ certs/
 # Runtime logs
 logs/
 *.log
+
+# Worktrees and private evidence
+.claude/
+evidence/raw/
