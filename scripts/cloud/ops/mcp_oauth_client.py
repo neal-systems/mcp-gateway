@@ -39,8 +39,10 @@ async def run(url: str, callback_port: int, expect_tools: int | None) -> int:
         mcp_url=url,
         client_name="mcp-gateway cloud evidence client",
         callback_port=callback_port,
-        callback_host="localhost",
-        callback_timeout=600.0,
+        # 127.0.0.1, not localhost: a Windows browser resolves localhost to ::1
+        # first while the callback server listens on IPv4.
+        callback_host="127.0.0.1",
+        callback_timeout=1800.0,
     )
     started = time.time()
     summary: dict = {"url": url, "checks": {}, "tools": [], "calls": {}}
