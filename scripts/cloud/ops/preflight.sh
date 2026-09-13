@@ -50,7 +50,11 @@ if gh api "repos/neal-systems/mcp-gateway/environments/demo" >/dev/null 2>&1; th
   environment_exists="true"
 fi
 
-variables_json=$(gh api "repos/neal-systems/mcp-gateway/environments/demo/variables" 2>/dev/null || echo '{"variables":[]}')
+# gh prints the API error body on stdout AND exits non-zero, so the fallback
+# must replace the output, not be appended to it.
+if ! variables_json=$(gh api "repos/neal-systems/mcp-gateway/environments/demo/variables" 2>/dev/null); then
+  variables_json='{"variables":[]}'
+fi
 
 PF_MISSING_TOOLS="${missing_tools}" \
 PF_ACCOUNT_MASKED="${account_masked}" \
