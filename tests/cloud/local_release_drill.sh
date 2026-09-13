@@ -7,11 +7,11 @@
 # compose render, the flock, the readiness wait, the known-good record and the
 # automatic rollback all run against actual containers.
 #
-# The app at this commit has no /healthz, no /readyz, no GATEWAY_STATE_DIR and
-# no GATEWAY_FAULT_INJECT (branch wp/app-core adds them). Every step that needs
-# one of those is still executed, but reported PENDING with the reason rather
-# than silently passing. Nothing here is rewritten to match the current app:
-# the assertions are the contract's.
+# The capability probe below keeps the drill honest against older app
+# commits: a step that needs /readyz, GATEWAY_STATE_DIR or GATEWAY_FAULT_INJECT
+# is still executed but reported PENDING with the reason rather than silently
+# passing. Nothing here is rewritten to match the app: the assertions are the
+# contract's.
 #
 # The OAuth values below are obvious non-secrets used only so the app will
 # start; they authenticate nothing and reach no real service.
@@ -53,6 +53,7 @@ record() {
 }
 
 # shellcheck disable=SC2317  # reached only through the EXIT trap below
+# shellcheck disable=SC2329  # invoked through the EXIT trap below
 cleanup() {
   say ""
   say "cleaning up"
@@ -511,9 +512,12 @@ say "-- state survives a container restart --"
 KEY_PATH="$TMP/srv/state/jwt_signing_key"
 CACHE_PATH="$TMP/srv/state/client_storage/cache.db"
 STATE_BEFORE=""
-if [ -f "$KEY_PATH" ]; then
+# The key is 0600 and owned by the app uid, so hash it from inside the
+# container rather than assuming the host user can read it.
+key_hash() { docker exec "$APP_CONTAINER" sha256sum /data/state/jwt_signing_key 2>/dev/null | cut -d' ' -f1; }
+if [ -e "$KEY_PATH" ] && [ -n "$(key_hash)" ]; then
   STATE_WHAT="key"
-  STATE_BEFORE="$(sha256sum "$KEY_PATH" | cut -d' ' -f1)"
+  STATE_BEFORE="$(key_hash)"
 elif [ -f "$CACHE_PATH" ]; then
   STATE_WHAT="cache"
   STATE_BEFORE="$(sha256sum "$CACHE_PATH" | cut -d' ' -f1)"
@@ -535,7 +539,7 @@ fi
 
 case "$STATE_WHAT" in
 key)
-  if [ "$(sha256sum "$KEY_PATH" | cut -d' ' -f1)" = "$STATE_BEFORE" ]; then
+  if [ "$(key_hash)" = "$STATE_BEFORE" ]; then
     record restart.signing_key PASS "state/jwt_signing_key is byte-identical after the restart"
   else
     record restart.signing_key FAIL "the signing key changed across a restart"
@@ -586,5 +590,5 @@ if [ "$FAILURES" -gt 0 ]; then
   say "drill finished with ${FAILURES} failing check(s)"
   exit 1
 fi
-say "drill finished: no failing checks (PENDING items await branch wp/app-core)"
+say "drill finished: no failing checks"
 exit 0
