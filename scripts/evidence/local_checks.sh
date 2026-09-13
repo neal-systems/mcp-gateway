@@ -52,5 +52,12 @@ $REC run --id container.restart_persistence --title "Container restart keeps sig
 $REC run --id container.log_redaction --title "Container log stream is JSON and redacted" \
   --class container --env local --image-digest "$digest" -- scripts/evidence/container_log_check.sh mcp-gateway:evidence
 
+# 8. Container: the whole release state machine against real containers:
+#    push/pull by digest, deploy A, A-to-B with a measured interruption,
+#    a candidate that never becomes ready (exit 3) rolled back automatically,
+#    rollback, status, smoke, evidence, and restart persistence.
+$REC run --id container.release_drill --title "Local release drill: deploy, upgrade, failed candidate, rollback" \
+  --class container --env local --image-digest "$digest" -- bash tests/cloud/local_release_drill.sh
+
 $REC render
 $REC summary
