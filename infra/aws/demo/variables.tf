@@ -44,3 +44,8 @@ variable "github_repo" {
   type        = string
   default     = "neal-systems/mcp-gateway"
 }
+
+variable "alert_email" {
+  description = "Where instance status-check alarms go. An address, not a secret; supplied at apply time."
+  type        = string
+}
