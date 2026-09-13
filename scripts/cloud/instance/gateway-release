@@ -651,6 +651,7 @@ usage: gateway-release <subcommand>
   status
   smoke
   evidence
+  render-config <release_id>   re-render the runtime env file only
 EOF
   exit 2
 }
@@ -674,6 +675,7 @@ main() {
     esac
     ;;
   status) do_status ;;
+  render-config) render_config "${2:?release id required}"; printf '{"action":"render-config","outcome":"rendered"}\n' ;;
   smoke) do_smoke ;;
   evidence) do_evidence ;;
   -h | --help | help) usage ;;
