@@ -48,10 +48,14 @@ source_file="${2:-/dev/stdin}"
   exit 2
 }
 
-# Build the request document and hand it to the CLI on stdin. A trailing
-# newline from an editor is stripped; anything else is preserved verbatim.
-version="$(
-  python3 -c '
+# Build the request document in a private temp file (0600, removed on exit)
+# and hand it to the CLI by path: the value never appears in argv, and the CLI
+# does not read reliably from /dev/stdin. A trailing newline from an editor is
+# stripped; anything else is preserved verbatim.
+request="$(mktemp)"
+chmod 0600 "$request"
+trap 'rm -f "$request"' EXIT
+python3 -c '
 import json, sys
 name = sys.argv[1]
 with open(sys.argv[2], "rb") as handle:
@@ -60,11 +64,11 @@ value = raw.decode("utf-8").rstrip("\n")
 if not value:
     sys.stderr.write("refusing to store an empty value\n")
     sys.exit(2)
-json.dump({"Name": name, "Value": value, "Type": "SecureString",
-           "Overwrite": True}, sys.stdout)
-' "$full" "$source_file" |
-    aws ssm put-parameter --cli-input-json file:///dev/stdin --output json |
-    python3 -c 'import json,sys; print(json.load(sys.stdin)["Version"])'
-)"
+with open(sys.argv[3], "w", encoding="utf-8") as out:
+    json.dump({"Name": name, "Value": value, "Type": "SecureString",
+               "Overwrite": True}, out)
+' "$full" "$source_file" "$request"
+version="$(aws ssm put-parameter --cli-input-json "file://${request}" --output json |
+  python3 -c 'import json,sys; print(json.load(sys.stdin)["Version"])')"
 
 printf '%s %s\n' "$full" "$version"

@@ -278,6 +278,33 @@ else
     "app will not start without an explicit signing key; wp/app-core adds generate-once"
 fi
 
+# ------------------------------------------ 2b. SSM-mode config rendering
+# The instance renders config.env from Parameter Store; the local drill uses a
+# file. Exercise the SSM code path with a fake response so the parameter-to-
+# environment mapping is tested here, not first on the live host.
+cat >"$TMP/fake-ssm.json" <<'JSON'
+{"Parameters": [
+  {"Name": "/mcp-gateway/demo/gateway_domain", "Value": "drill.example"},
+  {"Name": "/mcp-gateway/demo/github_client_id", "Value": "drill-client-id"},
+  {"Name": "/mcp-gateway/demo/github_client_secret", "Value": "drill-client-value"},
+  {"Name": "/mcp-gateway/demo/operator_github_ids", "Value": "111111111"},
+  {"Name": "/mcp-gateway/demo/unexpected_thing", "Value": "ignored"}
+]}
+JSON
+mkdir -p "$TMP/ssmroot"
+if GATEWAY_RELEASE_ROOT="$TMP/ssmroot" GATEWAY_CONFIG_FILE="$TMP/ssm-config.env" \
+  GATEWAY_STATE_ROOT="$TMP/srv" GATEWAY_CONFIG_SOURCE=ssm GATEWAY_SSM_FAKE_JSON="$TMP/fake-ssm.json" \
+  GATEWAY_IMAGE_ALLOW_LOCAL=1 GATEWAY_INSTANCE_ENV="$TMP/no-instance-env" \
+  bash -c 'source <(sed -n "/^render_config()/,/^}/p" "$0"); CONFIG_SOURCE=ssm; CONFIG_FILE="$GATEWAY_CONFIG_FILE"; SSM_PREFIX=/mcp-gateway/demo/; log(){ :; }; die(){ echo "$2" >&2; exit "$1"; }; need(){ :; }; render_config test-rid' "$GATEWAY_RELEASE_BIN" 2>"$TMP/ssm-render.err" \
+  && grep -q '^GATEWAY_OPERATOR_GITHUB_IDS=111111111$' "$TMP/ssm-config.env" \
+  && grep -q '^GITHUB_CLIENT_SECRET=drill-client-value$' "$TMP/ssm-config.env" \
+  && grep -q '^GATEWAY_BASE_URL=https://drill.example$' "$TMP/ssm-config.env" \
+  && ! grep -qi 'unexpected' "$TMP/ssm-config.env"; then
+  record config.ssm_mapping PASS "SSM parameters map to the application's environment names"
+else
+  record config.ssm_mapping FAIL "SSM-mode render did not produce the expected names ($(tr '\n' ' ' <"$TMP/ssm-render.err" | cut -c1-160))"
+fi
+
 # --------------------------------------------------- 3. manifest validation
 
 say ""

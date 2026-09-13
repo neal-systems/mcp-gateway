@@ -136,24 +136,43 @@ render_config() {
     return 0
   fi
 
-  need aws
   local rendered tmp domain
-  rendered="$(aws ssm get-parameters-by-path --path "$SSM_PREFIX" --recursive \
-    --with-decryption --output json)" ||
-    die 5 "cannot read SSM parameters under $SSM_PREFIX"
+  if [ -n "${GATEWAY_SSM_FAKE_JSON:-}" ]; then
+    # Test hook: a file shaped like the get-parameters-by-path response, so the
+    # SSM-mode render can be exercised without AWS. Never set on the instance.
+    rendered="$(cat "$GATEWAY_SSM_FAKE_JSON")"
+  else
+    need aws
+    rendered="$(aws ssm get-parameters-by-path --path "$SSM_PREFIX" --recursive \
+      --with-decryption --output json)" ||
+      die 5 "cannot read SSM parameters under $SSM_PREFIX"
+  fi
 
   tmp="$(mktemp)"
   chmod 0600 "$tmp"
+  # Parameter names are mapped explicitly to the names the application reads
+  # (CONTRACTS.md sections 1 and 6). An unknown parameter is ignored with a
+  # warning rather than smuggled into the environment.
   printf '%s' "$rendered" | python3 -c '
 import json, sys
+MAP = {
+    "gateway_domain": "GATEWAY_DOMAIN",
+    "github_client_id": "GITHUB_CLIENT_ID",
+    "github_client_secret": "GITHUB_CLIENT_SECRET",
+    "operator_github_ids": "GATEWAY_OPERATOR_GITHUB_IDS",
+    "viewer_github_ids": "GATEWAY_VIEWER_GITHUB_IDS",
+}
 doc = json.load(sys.stdin)
 for p in doc.get("Parameters", []):
-    name = p["Name"].rstrip("/").rsplit("/", 1)[-1].upper()
+    short = p["Name"].rstrip("/").rsplit("/", 1)[-1]
     value = p.get("Value", "")
+    if short not in MAP:
+        sys.stderr.write("ignoring unknown parameter %s\n" % short)
+        continue
     if "\n" in value or "\r" in value:
-        sys.stderr.write("parameter %s contains a newline; refusing\n" % name)
+        sys.stderr.write("parameter %s contains a newline; refusing\n" % short)
         sys.exit(1)
-    print("%s=%s" % (name, value))
+    print("%s=%s" % (MAP[short], value))
 ' >>"$tmp" || {
     rm -f "$tmp"
     die 5 "failed to render parameters from $SSM_PREFIX"
