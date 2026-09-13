@@ -68,3 +68,14 @@ variable "github_subject_format" {
     error_message = "github_subject_format must be \"immutable\" or \"legacy\"."
   }
 }
+
+variable "monthly_budget_usd" {
+  description = "Monthly cost budget for the account; alerts at 50 % and 100 % of it."
+  type        = number
+  default     = 10
+}
+
+variable "alert_email" {
+  description = "Where budget alerts go. An address, not a secret; supplied at apply time."
+  type        = string
+}
