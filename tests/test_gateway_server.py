@@ -20,12 +20,17 @@ ALLOWLIST = {
 
 
 def config(tmp_path: Path) -> dict:
+    state_dir = tmp_path / "state"
     return {
         "base_url": "https://gateway.example.com",
         "github_client_id": "obviously-fake-client-id",
         "github_client_secret": "obviously-fake-client-secret",
-        "jwt_signing_key": "test-signing-value-not-for-use",
+        "jwt_signing_key": "test-signing-value-not-for-use-but-32-chars",
+        "state_dir": str(state_dir),
         "client_storage": str(tmp_path / "oauth"),
+        "jwt_signing_key_file": str(state_dir / "jwt_signing_key"),
+        "release_id": "dev",
+        "fault_inject": None,
         "host": "127.0.0.1",
         "port": 8080,
         "sample_data": Path(__file__).parents[1] / "app" / "sample_data.json",
@@ -180,3 +185,50 @@ def test_example_tools_read_shipped_data(monkeypatch, tmp_path):
     assert len(json.loads(listed)) == 1
     assert json.loads(details)["status"] == "degraded"
     assert json.loads(searched)[0]["title"] == "Investigating elevated latency"
+
+
+def test_load_config_derives_state_paths_from_state_dir(monkeypatch, tmp_path):
+    state_dir = tmp_path / "custom-state"
+    monkeypatch.setenv("GATEWAY_STATE_DIR", str(state_dir))
+    monkeypatch.delenv("GATEWAY_CLIENT_STORAGE", raising=False)
+    monkeypatch.delenv("GATEWAY_JWT_SIGNING_KEY_FILE", raising=False)
+    monkeypatch.delenv("GATEWAY_RELEASE_ID", raising=False)
+    monkeypatch.delenv("GATEWAY_FAULT_INJECT", raising=False)
+
+    cfg = server.load_config()
+
+    assert cfg["state_dir"] == str(state_dir)
+    assert cfg["client_storage"] == str(state_dir / "client_storage")
+    assert cfg["jwt_signing_key_file"] == str(state_dir / "jwt_signing_key")
+    assert cfg["release_id"] == "dev"
+    assert cfg["fault_inject"] is None
+
+
+def test_load_config_respects_explicit_client_storage_override(monkeypatch, tmp_path):
+    state_dir = tmp_path / "state"
+    explicit_storage = tmp_path / "elsewhere"
+    monkeypatch.setenv("GATEWAY_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("GATEWAY_CLIENT_STORAGE", str(explicit_storage))
+
+    cfg = server.load_config()
+
+    assert cfg["client_storage"] == str(explicit_storage)
+
+
+def test_load_config_defaults_match_container_contract(monkeypatch):
+    for name in (
+        "GATEWAY_STATE_DIR",
+        "GATEWAY_CLIENT_STORAGE",
+        "GATEWAY_JWT_SIGNING_KEY_FILE",
+        "GATEWAY_RELEASE_ID",
+        "GATEWAY_FAULT_INJECT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    cfg = server.load_config()
+
+    assert cfg["state_dir"] == "/data/state"
+    assert cfg["client_storage"] == "/data/state/client_storage"
+    assert cfg["jwt_signing_key_file"] == "/data/state/jwt_signing_key"
+    assert cfg["release_id"] == "dev"
+    assert cfg["fault_inject"] is None

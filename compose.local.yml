@@ -1,0 +1,16 @@
+# Local override: run the gateway directly on localhost without Caddy/TLS.
+#
+#   docker compose -f docker-compose.yml -f compose.local.yml up mcp-app
+#
+# `caddy` is pinned to a profile that is never activated here, so a plain
+# `up` (no service name) with this override also starts only mcp-app.
+services:
+  mcp-app:
+    environment:
+      GATEWAY_HOST: 0.0.0.0
+    ports:
+      - "127.0.0.1:8080:8080"
+
+  caddy:
+    profiles:
+      - with-caddy
