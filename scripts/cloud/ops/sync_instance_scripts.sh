@@ -10,7 +10,7 @@ source "$HERE/_lib.sh"
 ops_parse_region "$@"
 ops_require_identity
 REPO_ROOT="$(cd "$HERE/../../.." && pwd)"
-instance_id="$(ops_find_demo_instance)"
+instance_id="$(ops_find_instance)"
 ops_require_project_tag "$instance_id"
 b64() { gzip -c "$1" | base64 -w0; }
 gr="$(b64 "$REPO_ROOT/scripts/cloud/instance/gateway-release")"
