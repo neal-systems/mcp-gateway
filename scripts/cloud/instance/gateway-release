@@ -629,10 +629,10 @@ KEYS = ("authorization|cookie|set-cookie|code|token|access_token|refresh_token|"
         "id_token|client_secret|client_id|signing_key|jwt_signing_key|password|"
         "secret|api_key")
 PATTERNS = [
-    (re.compile(r"(?<![A-Za-z0-9_.])(\"?(?:" + KEYS + r")\"?\s*[:=]\s*\"?)([^\"&\s,;]+)", re.I), r"\1<redacted>"),
+    (re.compile(r"(?i)bearer\s+[A-Za-z0-9._~+/-]{8,}=*"), "Bearer <redacted>"),
     (re.compile(r"gh[pousr]_[A-Za-z0-9]{8,}"), "<redacted-github-token>"),
     (re.compile(r"github_pat_[A-Za-z0-9_]{8,}"), "<redacted-github-token>"),
-    (re.compile(r"(?i)bearer\s+[A-Za-z0-9._~+/-]{8,}=*"), "Bearer <redacted>"),
+    (re.compile(r"(?<![A-Za-z0-9_.])(\"?(?:" + KEYS + r")\"?\s*[:=]\s*\"?)([^\"&\s,;]+)", re.I), r"\1<redacted>"),
     (re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}"), "<redacted-jwt>"),
     (re.compile(r"\b[0-9a-fA-F]{64}\b"), "<redacted-64hex>"),
 ]
