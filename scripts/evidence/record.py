@@ -54,7 +54,12 @@ def git_dirty():
                              capture_output=True, text=True, check=False)
     except OSError:
         return None
-    return bool(out.stdout.strip()) if out.returncode == 0 else None
+    if out.returncode != 0:
+        return None
+    # The recorder's own outputs do not count as a dirty tree.
+    own = ("evidence/", "docs/cloud/EVIDENCE.md")
+    changed = [l for l in out.stdout.splitlines() if l.strip() and not l[3:].startswith(own)]
+    return bool(changed)
 
 
 def git_head():
